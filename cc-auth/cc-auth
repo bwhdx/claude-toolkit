@@ -18,6 +18,8 @@ unset _source _dir
 
 # Source libraries
 source "$CC_TOOLKIT_ROOT/lib/common.bash"
+source "$CC_TOOLKIT_ROOT/lib/events.bash"
+source "$CC_TOOLKIT_ROOT/lib/scheduler.bash"
 source "$CC_TOOLKIT_ROOT/lib/process.bash"
 source "$CC_AUTH_ROOT/lib/keychain.bash"
 source "$CC_AUTH_ROOT/lib/vault.bash"
@@ -135,6 +137,7 @@ cmd_add() {
   fi
 
   log_ok "Added account '$name' ($acct_email, $sub_type)"
+  emit_event "$CC_AUTH_DIR" "account_added" "name=$name" "email=$acct_email" "type=$sub_type"
 
   # Restore previous credentials if we had them and this isn't the active account
   local active
@@ -164,6 +167,7 @@ cmd_remove() {
   vault_delete "$name"
   accounts_remove "$name"
   log_ok "Removed account '$name'"
+  emit_event "$CC_AUTH_DIR" "account_removed" "name=$name"
 
   if [[ "$active" == "$name" ]]; then
     # Clear active, cycle to next if possible
@@ -268,6 +272,7 @@ cmd_mark_limited() {
   accounts_name_exists "$name" || { log_error "Unknown account: $name"; return 1; }
   state_mark_limited "$name" "$secs"
   log_ok "Marked '$name' as limited for $(format_duration "$secs")"
+  emit_event "$CC_AUTH_DIR" "limit_marked" "name=$name" "seconds=$secs"
 }
 
 cmd_has_available() {
@@ -515,56 +520,39 @@ cmd_refresh_all() {
 }
 
 CC_AUTH_PLIST_LABEL="com.claude-toolkit.cc-auth-refresh"
-CC_AUTH_PLIST_DEST="$HOME/Library/LaunchAgents/$CC_AUTH_PLIST_LABEL.plist"
+CC_AUTH_REFRESH_INTERVAL=14400  # 4 hours
+CC_AUTH_REFRESH_LOG="/tmp/cc-auth-refresh.log"
 
 cmd_schedule() {
   local subcmd="${1:-status}"
+  local cc_auth_path
+  cc_auth_path=$(command -v cc-auth 2>/dev/null || echo "$CC_AUTH_ROOT/cc-auth")
 
   case "$subcmd" in
     install)
-      local plist_src="$CC_AUTH_ROOT/schedule/$CC_AUTH_PLIST_LABEL.plist"
-      if [[ ! -f "$plist_src" ]]; then
-        log_error "Plist template not found: $plist_src"
-        return 1
-      fi
-      # Generate plist with correct cc-auth path
-      local cc_auth_path
-      cc_auth_path=$(command -v cc-auth 2>/dev/null || echo "$CC_AUTH_ROOT/cc-auth")
-      mkdir -p "$(dirname "$CC_AUTH_PLIST_DEST")"
-      sed "s|__CC_AUTH_PATH__|$cc_auth_path|g" "$plist_src" > "$CC_AUTH_PLIST_DEST"
-      launchctl unload "$CC_AUTH_PLIST_DEST" 2>/dev/null || true
-      launchctl load "$CC_AUTH_PLIST_DEST"
-      log_ok "Token refresh scheduled (every 4 hours)"
-      log_dim "Plist: $CC_AUTH_PLIST_DEST"
-      log_dim "Log:   /tmp/cc-auth-refresh.log"
+      scheduler_install "$CC_AUTH_PLIST_LABEL" \
+        --interval "$CC_AUTH_REFRESH_INTERVAL" \
+        --command "$cc_auth_path refresh-all" \
+        --log "$CC_AUTH_REFRESH_LOG"
       ;;
     remove)
-      if [[ -f "$CC_AUTH_PLIST_DEST" ]]; then
-        launchctl unload "$CC_AUTH_PLIST_DEST" 2>/dev/null || true
-        rm -f "$CC_AUTH_PLIST_DEST"
-        log_ok "Token refresh schedule removed"
-      else
-        log_warn "No schedule installed"
-      fi
+      scheduler_uninstall "$CC_AUTH_PLIST_LABEL"
       ;;
     status)
-      if [[ -f "$CC_AUTH_PLIST_DEST" ]]; then
-        local loaded
-        loaded=$(launchctl list 2>/dev/null | grep "$CC_AUTH_PLIST_LABEL" || true)
-        if [[ -n "$loaded" ]]; then
-          echo -e "  Schedule: ${GREEN}active${NC} (every 4 hours)"
-          echo -e "  Plist:    $CC_AUTH_PLIST_DEST"
-          echo -e "  Log:      /tmp/cc-auth-refresh.log"
-          if [[ -f /tmp/cc-auth-refresh.log ]]; then
-            echo -e "  Last run: $(tail -1 /tmp/cc-auth-refresh.log 2>/dev/null || echo 'none')"
-          fi
-        else
-          echo -e "  Schedule: ${YELLOW}installed but not loaded${NC}"
-          echo "  Run: launchctl load $CC_AUTH_PLIST_DEST"
-        fi
-      else
-        echo -e "  Schedule: ${DIM}not installed${NC}"
-        echo "  Run: cc-auth schedule install"
+      local info
+      info=$(scheduler_status "$CC_AUTH_PLIST_LABEL")
+      local status interval
+      status=$(echo "$info" | jq -r '.status')
+      interval=$(echo "$info" | jq -r '.interval_seconds // 0')
+
+      local status_color="$GREEN"
+      [[ "$status" != "loaded" && "$status" != "running" ]] && status_color="$YELLOW"
+
+      echo -e "  Schedule: ${status_color}${status}${NC} (every $(format_duration "$interval"))"
+      echo -e "  Plist:    $(echo "$info" | jq -r '.plist_path')"
+      echo -e "  Log:      $(echo "$info" | jq -r '.log_stdout')"
+      if [[ -f "$CC_AUTH_REFRESH_LOG" ]]; then
+        echo -e "  Last run: $(tail -1 "$CC_AUTH_REFRESH_LOG" 2>/dev/null || echo 'none')"
       fi
       ;;
     *)

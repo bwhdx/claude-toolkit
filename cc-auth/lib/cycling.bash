@@ -57,6 +57,7 @@ cycle_account() {
     # Try to activate this account
     if _do_activate "$name"; then
       log_ok "Cycled: $current → $name"
+      emit_event "$CC_AUTH_DIR" "account_cycled" "from=$current" "to=$name"
       return 0
     else
       log_warn "Failed to activate $name, trying next..."
