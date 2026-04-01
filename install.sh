@@ -31,10 +31,19 @@ echo "Building cc-dashboard..."
 echo "Linking cc-auth..."
 ln -sf "$TOOLKIT_DIR/cc-auth/cc-auth" "$INSTALL_DIR/cc-auth"
 
+# Write toolkit discovery env file so consumers can find us
+ENV_DIR="$HOME/.claude-toolkit"
+mkdir -p "$ENV_DIR"
+cat > "$ENV_DIR/env" <<ENVEOF
+CLAUDE_TOOLKIT_DIR="$TOOLKIT_DIR"
+CLAUDE_TOOLKIT_VERSION="$(cd "$TOOLKIT_DIR" && git describe --tags --always 2>/dev/null || echo "dev")"
+ENVEOF
+
 echo ""
 echo "Installed:"
 echo "  cc-auth      → $INSTALL_DIR/cc-auth"
 echo "  cc-monitor   → $INSTALL_DIR/cc-monitor"
 echo "  cc-dashboard → $INSTALL_DIR/cc-dashboard"
+echo "  env          → $ENV_DIR/env"
 echo ""
 echo "Done! Run 'cc-auth init' to set up multi-account management."

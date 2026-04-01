@@ -514,6 +514,66 @@ cmd_refresh_all() {
   log_ok "All $count accounts checked"
 }
 
+CC_AUTH_PLIST_LABEL="com.claude-toolkit.cc-auth-refresh"
+CC_AUTH_PLIST_DEST="$HOME/Library/LaunchAgents/$CC_AUTH_PLIST_LABEL.plist"
+
+cmd_schedule() {
+  local subcmd="${1:-status}"
+
+  case "$subcmd" in
+    install)
+      local plist_src="$CC_AUTH_ROOT/schedule/$CC_AUTH_PLIST_LABEL.plist"
+      if [[ ! -f "$plist_src" ]]; then
+        log_error "Plist template not found: $plist_src"
+        return 1
+      fi
+      # Generate plist with correct cc-auth path
+      local cc_auth_path
+      cc_auth_path=$(command -v cc-auth 2>/dev/null || echo "$CC_AUTH_ROOT/cc-auth")
+      mkdir -p "$(dirname "$CC_AUTH_PLIST_DEST")"
+      sed "s|/Users/bwhdx/.local/bin/cc-auth|$cc_auth_path|g" "$plist_src" > "$CC_AUTH_PLIST_DEST"
+      launchctl unload "$CC_AUTH_PLIST_DEST" 2>/dev/null || true
+      launchctl load "$CC_AUTH_PLIST_DEST"
+      log_ok "Token refresh scheduled (every 4 hours)"
+      log_dim "Plist: $CC_AUTH_PLIST_DEST"
+      log_dim "Log:   /tmp/cc-auth-refresh.log"
+      ;;
+    remove)
+      if [[ -f "$CC_AUTH_PLIST_DEST" ]]; then
+        launchctl unload "$CC_AUTH_PLIST_DEST" 2>/dev/null || true
+        rm -f "$CC_AUTH_PLIST_DEST"
+        log_ok "Token refresh schedule removed"
+      else
+        log_warn "No schedule installed"
+      fi
+      ;;
+    status)
+      if [[ -f "$CC_AUTH_PLIST_DEST" ]]; then
+        local loaded
+        loaded=$(launchctl list 2>/dev/null | grep "$CC_AUTH_PLIST_LABEL" || true)
+        if [[ -n "$loaded" ]]; then
+          echo -e "  Schedule: ${GREEN}active${NC} (every 4 hours)"
+          echo -e "  Plist:    $CC_AUTH_PLIST_DEST"
+          echo -e "  Log:      /tmp/cc-auth-refresh.log"
+          if [[ -f /tmp/cc-auth-refresh.log ]]; then
+            echo -e "  Last run: $(tail -1 /tmp/cc-auth-refresh.log 2>/dev/null || echo 'none')"
+          fi
+        else
+          echo -e "  Schedule: ${YELLOW}installed but not loaded${NC}"
+          echo "  Run: launchctl load $CC_AUTH_PLIST_DEST"
+        fi
+      else
+        echo -e "  Schedule: ${DIM}not installed${NC}"
+        echo "  Run: cc-auth schedule install"
+      fi
+      ;;
+    *)
+      log_error "Usage: cc-auth schedule install|remove|status"
+      return 1
+      ;;
+  esac
+}
+
 # ── Usage ─────────────────────────────────────────────────────────────────────
 
 usage() {
@@ -544,6 +604,9 @@ ${BOLD}Status:${NC}
 ${BOLD}Rate limiting:${NC}
   mark-limited <name> <secs>    Record subscription limit for account
   has-available                  Exit 0 if any account is available
+
+${BOLD}Scheduling:${NC}
+  schedule install|remove|status  Manage token refresh schedule (launchd)
 
 ${BOLD}Examples:${NC}
   cc-auth init
@@ -576,6 +639,7 @@ main() {
     status)         cmd_status "$@" ;;
     refresh)        cmd_refresh "$@" ;;
     refresh-all)    cmd_refresh_all "$@" ;;
+    schedule)       cmd_schedule "$@" ;;
     help|--help|-h) usage ;;
     *)              log_error "Unknown command: $cmd"; usage; return 1 ;;
   esac
