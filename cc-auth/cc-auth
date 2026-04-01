@@ -1,0 +1,584 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# cc-auth — Multi-account token manager for Claude Code
+# Manages OAuth credentials for multiple Claude Code accounts,
+# enabling automatic cycling when subscription limits are hit.
+
+# Resolve symlinks to find the real script location
+_source="${BASH_SOURCE[0]}"
+while [[ -L "$_source" ]]; do
+  _dir="$(cd "$(dirname "$_source")" && pwd)"
+  _source="$(readlink "$_source")"
+  [[ "$_source" != /* ]] && _source="$_dir/$_source"
+done
+CC_AUTH_ROOT="$(cd "$(dirname "$_source")" && pwd)"
+CC_TOOLKIT_ROOT="$(cd "$CC_AUTH_ROOT/.." && pwd)"
+unset _source _dir
+
+# Source libraries
+source "$CC_TOOLKIT_ROOT/lib/common.bash"
+source "$CC_TOOLKIT_ROOT/lib/process.bash"
+source "$CC_AUTH_ROOT/lib/keychain.bash"
+source "$CC_AUTH_ROOT/lib/vault.bash"
+source "$CC_AUTH_ROOT/lib/cycling.bash"
+source "$CC_AUTH_ROOT/lib/detect.bash"
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_init() {
+  require_cmd jq || return 1
+  require_cmd openssl || return 1
+  require_cmd security "macOS 'security' command required for keychain access" || return 1
+  require_cmd claude "Claude Code CLI required" || return 1
+  vault_init
+}
+
+cmd_add() {
+  local name="" email="" skip_login=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --email) email="$2"; shift 2 ;;
+      --skip-login) skip_login=true; shift ;;
+      -*) log_error "Unknown option: $1"; return 1 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$name" ]]; then
+    log_error "Usage: cc-auth add <name> [--email <email>]"
+    return 1
+  fi
+
+  vault_is_initialized || { log_error "Run 'cc-auth init' first"; return 1; }
+
+  if accounts_name_exists "$name"; then
+    log_error "Account '$name' already exists. Use 'cc-auth remove $name' first."
+    return 1
+  fi
+
+  # Backup current credentials if this is the first account
+  local count
+  count=$(accounts_count)
+  local original_cred=""
+  if [[ "$count" -eq 0 ]] || [[ "$(state_active_account)" != "" ]]; then
+    original_cred=$(keychain_read 2>/dev/null || true)
+  fi
+
+  # Save original credentials as _original if first time
+  if [[ "$count" -eq 0 ]] && [[ -n "$original_cred" ]] && ! vault_exists "_original"; then
+    log_info "Backing up current credentials as '_original'"
+    vault_write "_original" "$original_cred"
+  fi
+
+  if [[ "$skip_login" == "true" ]]; then
+    # Capture current credentials without login flow
+    log_info "Capturing current Claude Code credentials for '$name'"
+  else
+    # Interactive login flow
+    log_info "Starting login flow for account '$name'"
+    [[ -n "$email" ]] && log_dim "Email: $email"
+
+    echo ""
+    echo "${BOLD}This will open a browser window for OAuth login.${NC}"
+    echo "Log in with the account you want to add as '${BOLD}$name${NC}'."
+    echo ""
+
+    # Logout current session
+    claude auth logout 2>/dev/null || true
+
+    # Start login
+    local login_args=()
+    [[ -n "$email" ]] && login_args+=(--email "$email")
+    claude auth login "${login_args[@]}" 2>&1 || {
+      log_error "Login failed or was cancelled"
+      # Restore original credentials
+      if [[ -n "$original_cred" ]]; then
+        keychain_write "$original_cred"
+      fi
+      return 1
+    }
+  fi
+
+  # Capture the credentials
+  local new_cred
+  new_cred=$(keychain_read) || {
+    log_error "Failed to read credentials from keychain after login"
+    if [[ -n "$original_cred" ]]; then
+      keychain_write "$original_cred"
+    fi
+    return 1
+  }
+
+  # Get account info
+  local auth_status
+  auth_status=$(keychain_auth_status) || true
+  local acct_email sub_type
+  acct_email=$(echo "$auth_status" | jq -r '.email // "unknown"')
+  sub_type=$(echo "$auth_status" | jq -r '.subscriptionType // "unknown"')
+  local rate_tier
+  rate_tier=$(echo "$new_cred" | jq -r '.claudeAiOauth.rateLimitTier // "unknown"')
+
+  # Store in vault
+  vault_write "$name" "$new_cred" || {
+    log_error "Failed to store credentials in vault"
+    return 1
+  }
+
+  # Register account
+  accounts_add "$name" "$acct_email" "$sub_type" "$rate_tier"
+  state_init_account "$name"
+
+  # If this is the first account, set it as active
+  if [[ -z "$(state_active_account)" ]]; then
+    state_set_active "$name"
+  fi
+
+  log_ok "Added account '$name' ($acct_email, $sub_type)"
+
+  # Restore previous credentials if we had them and this isn't the active account
+  local active
+  active=$(state_active_account)
+  if [[ "$active" != "$name" ]] && [[ -n "$original_cred" ]]; then
+    log_dim "Restoring previous active credentials"
+    keychain_write "$original_cred"
+  fi
+}
+
+cmd_remove() {
+  local name="$1"
+  [[ -z "$name" ]] && { log_error "Usage: cc-auth remove <name>"; return 1; }
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+
+  if ! accounts_name_exists "$name"; then
+    log_error "Unknown account: $name"
+    return 1
+  fi
+
+  local active
+  active=$(state_active_account)
+  if [[ "$active" == "$name" ]]; then
+    log_warn "Removing the currently active account"
+  fi
+
+  vault_delete "$name"
+  accounts_remove "$name"
+  log_ok "Removed account '$name'"
+
+  if [[ "$active" == "$name" ]]; then
+    # Clear active, cycle to next if possible
+    json_edit "$CC_AUTH_STATE_FILE" '.active_account = null'
+    local next
+    next=$(accounts_list_names | head -1)
+    if [[ -n "$next" ]]; then
+      log_info "Activating '$next' as the new active account"
+      _do_activate "$next" || true
+    fi
+  fi
+}
+
+cmd_list() {
+  local json_output=false
+  [[ "${1:-}" == "--json" ]] && json_output=true
+
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  state_clear_expired
+
+  local active
+  active=$(state_active_account)
+
+  if [[ "$json_output" == "true" ]]; then
+    # Build JSON array with status
+    local accounts_json
+    accounts_json=$(jq -r '.accounts[].name' "$CC_AUTH_ACCOUNTS_FILE")
+    echo "["
+    local first=true
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      [[ "$first" == "true" ]] && first=false || echo ","
+      local acct_info limited remaining
+      acct_info=$(accounts_get "$name")
+      limited=false
+      remaining=0
+      if state_is_limited "$name"; then
+        limited=true
+        remaining=$(state_limit_remaining "$name")
+      fi
+      local status="available"
+      [[ "$name" == "$active" ]] && status="active"
+      [[ "$limited" == "true" ]] && status="limited"
+
+      jq -n --argjson info "$acct_info" \
+        --arg status "$status" \
+        --argjson limited "$limited" \
+        --argjson remaining "$remaining" \
+        '$info + {status: $status, limited: $limited, limit_remaining: $remaining}'
+    done <<< "$accounts_json"
+    echo "]"
+    return
+  fi
+
+  # Table output
+  local count
+  count=$(accounts_count)
+  echo "${BOLD}ACCOUNTS${NC} ($count)"
+  echo ""
+
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    local email sub_type
+    email=$(accounts_get "$name" | jq -r '.email // "?"')
+    sub_type=$(accounts_get "$name" | jq -r '.subscriptionType // "?"')
+
+    local status_str status_color
+    if [[ "$name" == "$active" ]]; then
+      status_str="ACTIVE"
+      status_color="$GREEN"
+    elif state_is_limited "$name"; then
+      local remaining
+      remaining=$(state_limit_remaining "$name")
+      status_str="limited ($(format_duration "$remaining"))"
+      status_color="$YELLOW"
+    else
+      status_str="available"
+      status_color="$CYAN"
+    fi
+
+    printf "  %-12s %-30s %-6s ${status_color}%-20s${NC}\n" \
+      "$name" "$email" "$sub_type" "$status_str"
+  done < <(accounts_list_names)
+}
+
+cmd_activate() {
+  local name="$1"
+  [[ -z "$name" ]] && { log_error "Usage: cc-auth activate <name>"; return 1; }
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  activate_account "$name"
+}
+
+cmd_cycle() {
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  cycle_account
+}
+
+cmd_mark_limited() {
+  local name="${1:-}" secs="${2:-}"
+  [[ -z "$name" || -z "$secs" ]] && { log_error "Usage: cc-auth mark-limited <name> <seconds>"; return 1; }
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  accounts_name_exists "$name" || { log_error "Unknown account: $name"; return 1; }
+  state_mark_limited "$name" "$secs"
+  log_ok "Marked '$name' as limited for $(format_duration "$secs")"
+}
+
+cmd_has_available() {
+  vault_is_initialized || return 1
+  has_available_account
+}
+
+cmd_active_name() {
+  vault_is_initialized || return 1
+  local name
+  name=$(state_active_account)
+  [[ -n "$name" ]] && echo "$name" || return 1
+}
+
+cmd_verify() {
+  local target="${1:-}"
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+
+  _verify_one() {
+    local name="$1"
+    local cred
+    cred=$(vault_read "$name") || { log_error "$name: vault read failed"; return 1; }
+
+    if keychain_cred_expired "$cred"; then
+      log_warn "$name: token expired"
+      return 1
+    fi
+
+    local expires_at now_ms remaining_hrs
+    expires_at=$(echo "$cred" | jq -r '.claudeAiOauth.expiresAt // 0')
+    now_ms=$(( $(now_epoch) * 1000 ))
+    remaining_hrs=$(( (expires_at - now_ms) / 3600000 ))
+    log_ok "$name: valid (expires in ~${remaining_hrs}h)"
+    return 0
+  }
+
+  if [[ "$target" == "--all" || -z "$target" ]]; then
+    local any_failed=false
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      _verify_one "$name" || any_failed=true
+    done < <(accounts_list_names)
+    [[ "$any_failed" == "false" ]]
+  else
+    _verify_one "$target"
+  fi
+}
+
+cmd_restore() {
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+
+  if ! vault_exists "_original"; then
+    log_error "No original credentials backup found"
+    return 1
+  fi
+
+  local cred
+  cred=$(vault_read "_original") || return 1
+  keychain_write "$cred"
+  json_edit "$CC_AUTH_STATE_FILE" '.active_account = null'
+  log_ok "Restored original credentials"
+}
+
+cmd_status() {
+  local json_output=false
+  [[ "${1:-}" == "--json" ]] && json_output=true
+
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  state_clear_expired
+
+  local active count
+  active=$(state_active_account)
+  count=$(accounts_count)
+
+  if [[ "$json_output" == "true" ]]; then
+    local available=0 limited=0
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      if state_is_limited "$name"; then
+        limited=$((limited + 1))
+      else
+        available=$((available + 1))
+      fi
+    done < <(accounts_list_names)
+
+    jq -n \
+      --arg active "$active" \
+      --argjson total "$count" \
+      --argjson available "$available" \
+      --argjson limited "$limited" \
+      '{active_account: $active, total: $total, available: $available, limited: $limited}'
+    return
+  fi
+
+  echo "${BOLD}cc-auth status${NC}"
+  echo ""
+  echo "  Active account: ${GREEN}${active:-none}${NC}"
+
+  if [[ -n "$active" ]]; then
+    local email
+    email=$(accounts_get "$active" | jq -r '.email // "?"')
+    echo "  Email:          $email"
+  fi
+
+  echo "  Total accounts: $count"
+
+  local available=0 limited=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if state_is_limited "$name"; then
+      limited=$((limited + 1))
+    else
+      available=$((available + 1))
+    fi
+  done < <(accounts_list_names)
+
+  echo "  Available:      ${GREEN}$available${NC}"
+  [[ "$limited" -gt 0 ]] && echo "  Limited:        ${YELLOW}$limited${NC}"
+  echo ""
+
+  # Show each account briefly
+  cmd_list
+}
+
+cmd_refresh() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && { log_error "Usage: cc-auth refresh <name>"; return 1; }
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  accounts_name_exists "$name" || { log_error "Unknown account: $name"; return 1; }
+
+  local email
+  email=$(accounts_get "$name" | jq -r '.email // empty')
+
+  log_info "Re-authenticating account '$name' ($email)"
+  log_dim "This will open a browser for OAuth login."
+
+  # Save current active account's creds
+  local active original_cred
+  active=$(state_active_account)
+  original_cred=$(keychain_read 2>/dev/null || true)
+
+  # Logout + login
+  claude auth logout 2>/dev/null || true
+  local login_args=()
+  [[ -n "$email" ]] && login_args+=(--email "$email")
+  claude auth login "${login_args[@]}" 2>&1 || {
+    log_error "Login failed"
+    [[ -n "$original_cred" ]] && keychain_write "$original_cred"
+    return 1
+  }
+
+  # Capture new credentials
+  local new_cred
+  new_cred=$(keychain_read) || {
+    log_error "Failed to read new credentials"
+    [[ -n "$original_cred" ]] && keychain_write "$original_cred"
+    return 1
+  }
+
+  # Update vault
+  vault_write "$name" "$new_cred"
+  accounts_touch_verified "$name"
+  log_ok "Refreshed credentials for '$name'"
+
+  # Restore previous active if different
+  if [[ "$active" != "$name" ]] && [[ -n "$original_cred" ]]; then
+    keychain_write "$original_cred"
+  else
+    state_set_active "$name"
+  fi
+}
+
+cmd_refresh_all() {
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+
+  local original_active
+  original_active=$(state_active_account)
+  local original_cred
+  original_cred=$(keychain_read 2>/dev/null || true)
+
+  local any_failed=false
+  local count=0
+
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    count=$((count + 1))
+
+    local cred_json
+    cred_json=$(vault_read "$name") || { log_error "$name: vault read failed"; any_failed=true; continue; }
+
+    # Check if token is still valid (>1h remaining)
+    local expires_at now_ms remaining_hrs
+    expires_at=$(echo "$cred_json" | jq -r '.claudeAiOauth.expiresAt // 0')
+    now_ms=$(( $(now_epoch) * 1000 ))
+    remaining_hrs=$(( (expires_at - now_ms) / 3600000 ))
+
+    if [[ "$remaining_hrs" -gt 1 ]]; then
+      log_dim "$name: still valid (~${remaining_hrs}h remaining), skipping"
+      continue
+    fi
+
+    log_info "$name: token expiring soon (~${remaining_hrs}h), refreshing..."
+
+    # Activate this account to let Claude Code refresh its token
+    keychain_write "$cred_json" || { log_warn "$name: keychain write failed"; any_failed=true; continue; }
+
+    # Give Claude Code a moment then re-read the (potentially refreshed) keychain
+    local refreshed_cred
+    refreshed_cred=$(keychain_read) || { log_warn "$name: keychain read failed after activation"; any_failed=true; continue; }
+
+    # Check if token changed (Claude Code auto-refreshed it)
+    local old_prefix new_prefix
+    old_prefix=$(echo "$cred_json" | jq -r '.claudeAiOauth.accessToken[:20]')
+    new_prefix=$(echo "$refreshed_cred" | jq -r '.claudeAiOauth.accessToken[:20]')
+
+    if [[ "$old_prefix" != "$new_prefix" ]]; then
+      vault_write "$name" "$refreshed_cred"
+      accounts_touch_verified "$name"
+      log_ok "$name: token refreshed"
+    else
+      # Token didn't change — may need interactive re-auth
+      local new_expires
+      new_expires=$(echo "$refreshed_cred" | jq -r '.claudeAiOauth.expiresAt // 0')
+      local new_remaining=$(( (new_expires - now_ms) / 3600000 ))
+      if [[ "$new_remaining" -le 0 ]]; then
+        log_warn "$name: token expired, run 'cc-auth refresh $name' to re-authenticate"
+        any_failed=true
+      else
+        log_dim "$name: token unchanged (~${new_remaining}h remaining)"
+      fi
+    fi
+  done < <(accounts_list_names)
+
+  # Restore original active account
+  if [[ -n "$original_cred" ]]; then
+    keychain_write "$original_cred"
+  fi
+  [[ -n "$original_active" ]] && state_set_active "$original_active"
+
+  if [[ "$any_failed" == "true" ]]; then
+    log_warn "Some accounts need manual refresh (cc-auth refresh <name>)"
+    return 1
+  fi
+  log_ok "All $count accounts checked"
+}
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+${BOLD}cc-auth${NC} — Multi-account token manager for Claude Code
+
+${BOLD}Usage:${NC}
+  cc-auth <command> [options]
+
+${BOLD}Setup:${NC}
+  init                          Initialize vault and encryption key
+  add <name> [--email <email>]  Add account (opens browser for OAuth)
+  remove <name>                 Remove account from vault
+  refresh <name>                Re-authenticate an account (browser)
+  refresh-all                   Check all tokens, refresh expiring ones
+
+${BOLD}Switching:${NC}
+  activate <name>               Switch to a specific account
+  cycle                         Switch to next available account
+  restore                       Restore original pre-cc-auth credentials
+
+${BOLD}Status:${NC}
+  list [--json]                 List all accounts with status
+  status [--json]               Show active account and availability
+  verify [<name>|--all]         Check token validity
+  active-name                   Print active account name
+
+${BOLD}Rate limiting:${NC}
+  mark-limited <name> <secs>    Record subscription limit for account
+  has-available                  Exit 0 if any account is available
+
+${BOLD}Examples:${NC}
+  cc-auth init
+  cc-auth add ops1 --email operations@kash.bot
+  cc-auth add ops2 --email ops2@kash.bot
+  cc-auth cycle
+  cc-auth mark-limited ops1 14400
+  cc-auth status
+EOF
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    init)           cmd_init "$@" ;;
+    add)            cmd_add "$@" ;;
+    remove)         cmd_remove "$@" ;;
+    list)           cmd_list "$@" ;;
+    activate)       cmd_activate "$@" ;;
+    cycle)          cmd_cycle "$@" ;;
+    mark-limited)   cmd_mark_limited "$@" ;;
+    has-available)  cmd_has_available "$@" ;;
+    active-name)    cmd_active_name "$@" ;;
+    verify)         cmd_verify "$@" ;;
+    restore)        cmd_restore "$@" ;;
+    status)         cmd_status "$@" ;;
+    refresh)        cmd_refresh "$@" ;;
+    refresh-all)    cmd_refresh_all "$@" ;;
+    help|--help|-h) usage ;;
+    *)              log_error "Unknown command: $cmd"; usage; return 1 ;;
+  esac
+}
+
+main "$@"

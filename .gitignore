@@ -1,0 +1,18 @@
+# Binaries
+cc-monitor/cc-monitor
+cc-dashboard/cc-dashboard
+*.exe
+
+# Go
+vendor/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Vault (never commit credentials)
+.cc-auth/
