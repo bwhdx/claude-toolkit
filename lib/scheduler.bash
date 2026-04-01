@@ -1,22 +1,33 @@
 #!/usr/bin/env bash
-# claude-toolkit shared scheduler — unified launchd/cron job management
+# claude-toolkit shared scheduler — unified launchd/systemd/cron job management
 # Source this in any consumer for standardized scheduled job install/remove/status.
+#
+# Supports: macOS (launchd), Linux (systemd timer → cron fallback)
+# Features: environment variables, log paths, persistent timers
 
 SCHEDULER_AGENTS_DIR="$HOME/Library/LaunchAgents"
+SCHEDULER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 
-# Install a scheduled job.
-# Args: label --interval SECS --command CMD [--log PATH] [--log-stderr PATH]
-# Example: scheduler_install "com.claude-toolkit.my-tool" --interval 300 --command "/usr/local/bin/my-tool run" --log "/tmp/my-tool.log"
+# Install a scheduled job (auto-detects platform).
+# Args: label --interval SECS --command CMD [--log PATH] [--log-stderr PATH] [--env KEY=VALUE ...]
+# Example:
+#   scheduler_install "com.ax.dispatch" \
+#     --interval 300 \
+#     --command "/path/to/ax dispatch --foreground" \
+#     --log "/path/to/log" \
+#     --env "PATH=/usr/local/bin:/usr/bin:/bin"
 scheduler_install() {
   local label="$1"; shift
 
   local interval="" command="" log_stdout="" log_stderr=""
+  local -a env_vars=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --interval)    interval="$2"; shift 2 ;;
       --command)     command="$2"; shift 2 ;;
       --log)         log_stdout="$2"; shift 2 ;;
       --log-stderr)  log_stderr="$2"; shift 2 ;;
+      --env)         env_vars+=("$2"); shift 2 ;;
       *) shift ;;
     esac
   done
@@ -27,9 +38,11 @@ scheduler_install() {
   fi
 
   if is_macos; then
-    _scheduler_install_launchd "$label" "$interval" "$command" "$log_stdout" "$log_stderr"
+    _scheduler_install_launchd "$label" "$interval" "$command" "$log_stdout" "$log_stderr" "${env_vars[@]+"${env_vars[@]}"}"
+  elif command -v systemctl >/dev/null 2>&1; then
+    _scheduler_install_systemd "$label" "$interval" "$command" "$log_stdout" "${env_vars[@]+"${env_vars[@]}"}"
   else
-    _scheduler_install_cron "$label" "$interval" "$command"
+    _scheduler_install_cron "$label" "$interval" "$command" "${env_vars[@]+"${env_vars[@]}"}"
   fi
 }
 
@@ -40,6 +53,8 @@ scheduler_uninstall() {
 
   if is_macos; then
     _scheduler_uninstall_launchd "$label"
+  elif [[ -f "$SCHEDULER_SYSTEMD_DIR/${label}.timer" ]]; then
+    _scheduler_uninstall_systemd "$label"
   else
     _scheduler_uninstall_cron "$label"
   fi
@@ -52,6 +67,8 @@ scheduler_status() {
 
   if is_macos; then
     _scheduler_status_launchd "$label"
+  elif [[ -f "$SCHEDULER_SYSTEMD_DIR/${label}.timer" ]]; then
+    _scheduler_status_systemd "$label"
   else
     _scheduler_status_cron "$label"
   fi
@@ -61,6 +78,8 @@ scheduler_status() {
 
 _scheduler_install_launchd() {
   local label="$1" interval="$2" command="$3" log_stdout="$4" log_stderr="$5"
+  shift 5
+  local -a env_vars=("$@")
   local plist="$SCHEDULER_AGENTS_DIR/${label}.plist"
 
   mkdir -p "$SCHEDULER_AGENTS_DIR"
@@ -69,7 +88,6 @@ _scheduler_install_launchd() {
   local -a cmd_parts
   read -ra cmd_parts <<< "$command"
 
-  # Build plist
   local prog_args=""
   for part in "${cmd_parts[@]}"; do
     prog_args+="        <string>${part}</string>
@@ -87,9 +105,24 @@ _scheduler_install_launchd() {
     <string>${log_stderr}</string>
 "
   elif [[ -n "$log_stdout" ]]; then
-    # Default stderr to same as stdout
     log_entries+="    <key>StandardErrorPath</key>
     <string>${log_stdout}</string>
+"
+  fi
+
+  # Build EnvironmentVariables block
+  local env_block=""
+  if [[ ${#env_vars[@]} -gt 0 ]]; then
+    env_block="    <key>EnvironmentVariables</key>
+    <dict>
+"
+    for ev in "${env_vars[@]}"; do
+      local key="${ev%%=*}" val="${ev#*=}"
+      env_block+="        <key>${key}</key>
+        <string>${val}</string>
+"
+    done
+    env_block+="    </dict>
 "
   fi
 
@@ -105,7 +138,7 @@ _scheduler_install_launchd() {
 ${prog_args}    </array>
     <key>StartInterval</key>
     <integer>${interval}</integer>
-${log_entries}    <key>RunAtLoad</key>
+${log_entries}${env_block}    <key>RunAtLoad</key>
     <false/>
 </dict>
 </plist>
@@ -139,12 +172,10 @@ _scheduler_status_launchd() {
   local log_stdout="" log_stderr=""
 
   if [[ -f "$plist" ]]; then
-    # Extract config from plist
     interval=$(plutil -extract StartInterval raw -o - "$plist" 2>/dev/null || echo "null")
     log_stdout=$(plutil -extract StandardOutPath raw -o - "$plist" 2>/dev/null || echo "")
     log_stderr=$(plutil -extract StandardErrorPath raw -o - "$plist" 2>/dev/null || echo "")
 
-    # Query runtime state
     local line
     line=$(launchctl list 2>/dev/null | grep -F "$label" || true)
     if [[ -n "$line" ]]; then
@@ -180,15 +211,96 @@ _scheduler_status_launchd() {
     }'
 }
 
-# ── Linux (cron) implementation — stubs ───────────────────────────────────────
+# ── Linux (systemd) implementation ────────────────────────────────────────────
+
+_scheduler_install_systemd() {
+  local label="$1" interval="$2" command="$3" log_stdout="$4"
+  shift 4
+  local -a env_vars=("$@")
+
+  mkdir -p "$SCHEDULER_SYSTEMD_DIR"
+
+  # Build Environment lines
+  local env_lines=""
+  for ev in "${env_vars[@]+"${env_vars[@]}"}"; do
+    env_lines+="Environment=${ev}
+"
+  done
+
+  # Service unit
+  cat > "$SCHEDULER_SYSTEMD_DIR/${label}.service" <<SEOF
+[Unit]
+Description=${label}
+
+[Service]
+Type=oneshot
+ExecStart=${command}
+${env_lines}
+SEOF
+
+  # Timer unit
+  cat > "$SCHEDULER_SYSTEMD_DIR/${label}.timer" <<TEOF
+[Unit]
+Description=${label} timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=${interval}s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TEOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now "${label}.timer"
+  log_ok "Scheduled $label via systemd (every $(format_duration "$interval"))"
+}
+
+_scheduler_uninstall_systemd() {
+  local label="$1"
+  systemctl --user disable --now "${label}.timer" 2>/dev/null || true
+  rm -f "$SCHEDULER_SYSTEMD_DIR/${label}.timer"
+  rm -f "$SCHEDULER_SYSTEMD_DIR/${label}.service"
+  systemctl --user daemon-reload
+  log_ok "Removed $label (systemd)"
+}
+
+_scheduler_status_systemd() {
+  local label="$1"
+  local status="not installed"
+
+  if [[ -f "$SCHEDULER_SYSTEMD_DIR/${label}.timer" ]]; then
+    if systemctl --user is-active "${label}.timer" >/dev/null 2>&1; then
+      status="active"
+    else
+      status="installed (inactive)"
+    fi
+  fi
+
+  jq -n \
+    --arg label "$label" \
+    --arg status "$status" \
+    '{label: $label, status: $status, platform: "systemd"}'
+}
+
+# ── Linux (cron) fallback ─────────────────────────────────────────────────────
 
 _scheduler_install_cron() {
   local label="$1" interval="$2" command="$3"
+  shift 3
+  local -a env_vars=("$@")
+
   local interval_min=$(( interval / 60 ))
   [[ "$interval_min" -lt 1 ]] && interval_min=1
 
-  # Add cron entry with label comment
-  local cron_line="*/${interval_min} * * * * ${command} # ${label}"
+  # Build env prefix
+  local env_prefix=""
+  for ev in "${env_vars[@]+"${env_vars[@]}"}"; do
+    env_prefix+="${ev} "
+  done
+
+  local cron_line="*/${interval_min} * * * * ${env_prefix}${command} # ${label}"
   (crontab -l 2>/dev/null | grep -v "# ${label}"; echo "$cron_line") | crontab -
   log_ok "Scheduled $label via cron (every ${interval_min}m)"
 }
@@ -211,5 +323,5 @@ _scheduler_status_cron() {
     --arg label "$label" \
     --arg status "$status" \
     --arg entry "$entry" \
-    '{label: $label, status: $status, cron_entry: $entry}'
+    '{label: $label, status: $status, platform: "cron", cron_entry: $entry}'
 }
