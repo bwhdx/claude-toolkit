@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# cc-jobs — Visibility into all toolkit-related scheduled jobs
+# Discovers and reports on launchd agents and crontab entries
+# matching toolkit conventions (com.ax.*, com.claude-toolkit.*).
+
+# Resolve symlinks to find the real script location
+_source="${BASH_SOURCE[0]}"
+while [[ -L "$_source" ]]; do
+  _dir="$(cd "$(dirname "$_source")" && pwd)"
+  _source="$(readlink "$_source")"
+  [[ "$_source" != /* ]] && _source="$_dir/$_source"
+done
+CC_JOBS_ROOT="$(cd "$(dirname "$_source")" && pwd)"
+CC_TOOLKIT_ROOT="$(cd "$CC_JOBS_ROOT/.." && pwd)"
+unset _source _dir
+
+# Source libraries
+source "$CC_TOOLKIT_ROOT/lib/common.bash"
+source "$CC_TOOLKIT_ROOT/lib/process.bash"
+source "$CC_JOBS_ROOT/lib/launchd.bash"
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_list() {
+  local json_output=false
+  [[ "${1:-}" == "--json" ]] && json_output=true
+
+  local -a jobs=()
+  while IFS= read -r plist; do
+    [[ -n "$plist" ]] || continue
+    local info
+    info=$(build_job_info "$plist" 2>/dev/null) || continue
+    jobs+=("$info")
+  done < <(scan_toolkit_plists)
+
+  # Also check crontab
+  local cron_entries
+  cron_entries=$(scan_crontab)
+
+  if [[ "$json_output" == "true" ]]; then
+    # Combine launchd jobs + cron entries
+    local launchd_json="[]"
+    for j in "${jobs[@]+"${jobs[@]}"}"; do
+      launchd_json=$(echo "$launchd_json" | jq --argjson job "$j" '. + [$job]')
+    done
+    echo "$launchd_json"
+    return
+  fi
+
+  # Table output
+  local now
+  now=$(now_epoch)
+
+  echo -e "${BOLD}TOOLKIT JOBS${NC} — $(date '+%Y-%m-%d %H:%M %Z')"
+  echo ""
+
+  if [[ ${#jobs[@]} -eq 0 ]]; then
+    echo "  No toolkit jobs found."
+    echo "  Install with: ax schedule install, cc-auth schedule install"
+    return
+  fi
+
+  printf "  ${DIM}%-38s %-10s %-10s %-16s %s${NC}\n" \
+    "LABEL" "STATUS" "INTERVAL" "LAST RUN" "EXIT"
+
+  local loaded=0 running=0
+  for j in "${jobs[@]}"; do
+    local label status interval_s last_run_epoch exit_code
+    label=$(echo "$j" | jq -r '.label')
+    status=$(echo "$j" | jq -r '.status')
+    interval_s=$(echo "$j" | jq -r '.interval_seconds // 0')
+    last_run_epoch=$(echo "$j" | jq -r '.last_run_epoch // empty')
+    exit_code=$(echo "$j" | jq -r '.last_exit_code // "-"')
+
+    # Format interval
+    local interval_str
+    interval_str=$(format_duration "$interval_s")
+
+    # Format last run
+    local last_run_str="never"
+    if [[ -n "$last_run_epoch" && "$last_run_epoch" != "null" ]]; then
+      local ago=$(( now - last_run_epoch ))
+      last_run_str="$(format_duration "$ago") ago"
+    fi
+
+    # Status coloring
+    local status_color="$CYAN"
+    case "$status" in
+      running) status_color="$GREEN"; running=$((running + 1)); loaded=$((loaded + 1)) ;;
+      loaded)  status_color="$GREEN"; loaded=$((loaded + 1)) ;;
+      *)       status_color="$YELLOW" ;;
+    esac
+
+    # Exit code coloring
+    local exit_str="$exit_code"
+    if [[ "$exit_code" == "0" ]]; then
+      exit_str="${GREEN}0${NC}"
+    elif [[ "$exit_code" != "-" && "$exit_code" != "null" ]]; then
+      exit_str="${RED}${exit_code}${NC}"
+    fi
+
+    printf "  %-38s ${status_color}%-10s${NC} %-10s %-16s %b\n" \
+      "$label" "$status" "$interval_str" "$last_run_str" "$exit_str"
+  done
+
+  # Cron entries
+  local cron_count
+  cron_count=$(echo "$cron_entries" | jq 'length')
+  if [[ "$cron_count" -gt 0 ]]; then
+    echo ""
+    echo -e "  ${DIM}CRON ENTRIES${NC}"
+    echo "$cron_entries" | jq -r '.[].entry' | while IFS= read -r entry; do
+      echo "  $entry"
+    done
+  fi
+
+  echo ""
+  local total=${#jobs[@]}
+  echo -e "  ${total} jobs (${loaded} loaded, ${running} running)"
+}
+
+cmd_status() {
+  local label="${1:-}"
+  [[ -z "$label" ]] && { log_error "Usage: cc-jobs status <label>"; return 1; }
+
+  # Find the plist for this label
+  local plist=""
+  while IFS= read -r p; do
+    local plabel
+    plabel=$(plutil -extract Label raw -o - "$p" 2>/dev/null || true)
+    if [[ "$plabel" == "$label" ]]; then
+      plist="$p"
+      break
+    fi
+  done < <(scan_toolkit_plists)
+
+  if [[ -z "$plist" ]]; then
+    log_error "Job not found: $label"
+    echo "Known jobs:"
+    scan_toolkit_plists | while IFS= read -r p; do
+      plutil -extract Label raw -o - "$p" 2>/dev/null | sed 's/^/  /'
+    done
+    return 1
+  fi
+
+  local info
+  info=$(build_job_info "$plist") || { log_error "Failed to read job info"; return 1; }
+
+  local now
+  now=$(now_epoch)
+
+  # Display detailed info
+  echo -e "${BOLD}$label${NC}"
+  echo ""
+
+  local status command_str interval_s plist_path log_stdout log_stderr
+  local exit_code runs last_run_epoch state
+
+  status=$(echo "$info" | jq -r '.status')
+  command_str=$(echo "$info" | jq -r '.command | join(" ")')
+  interval_s=$(echo "$info" | jq -r '.interval_seconds // 0')
+  plist_path=$(echo "$info" | jq -r '.plist_path')
+  log_stdout=$(echo "$info" | jq -r '.log_stdout // empty')
+  log_stderr=$(echo "$info" | jq -r '.log_stderr // empty')
+  exit_code=$(echo "$info" | jq -r '.last_exit_code // "-"')
+  runs=$(echo "$info" | jq -r '.runs // "-"')
+  state=$(echo "$info" | jq -r '.state // "unknown"')
+  last_run_epoch=$(echo "$info" | jq -r '.last_run_epoch // empty')
+
+  local status_color="$GREEN"
+  [[ "$status" != "loaded" && "$status" != "running" ]] && status_color="$YELLOW"
+
+  echo -e "  Status:    ${status_color}${status}${NC} (state: $state)"
+  echo "  Command:   $command_str"
+  echo "  Interval:  ${interval_s}s ($(format_duration "$interval_s"))"
+  echo "  Plist:     $plist_path"
+
+  if [[ -n "$log_stdout" ]]; then
+    local log_size=""
+    [[ -f "$log_stdout" ]] && log_size=" ($(wc -l < "$log_stdout" | tr -d ' ') lines)"
+    echo "  Log out:   ${log_stdout}${log_size}"
+  fi
+  if [[ -n "$log_stderr" && "$log_stderr" != "$log_stdout" ]]; then
+    local log_size=""
+    [[ -f "$log_stderr" ]] && log_size=" ($(wc -l < "$log_stderr" | tr -d ' ') lines)"
+    echo "  Log err:   ${log_stderr}${log_size}"
+  fi
+
+  echo ""
+  echo -e "  ${DIM}Metrics${NC}"
+
+  if [[ -n "$last_run_epoch" && "$last_run_epoch" != "null" ]]; then
+    local ago=$(( now - last_run_epoch ))
+    local last_run_fmt
+    last_run_fmt=$(date -r "$last_run_epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")
+    echo "  Last run:  $last_run_fmt ($(format_duration "$ago") ago)"
+  else
+    echo "  Last run:  never"
+  fi
+
+  echo "  Exit code: $exit_code"
+  echo "  Runs:      $runs"
+}
+
+cmd_logs() {
+  local label="${1:-}"
+  [[ -z "$label" ]] && { log_error "Usage: cc-jobs logs <label>"; return 1; }
+
+  # Find the plist and extract log path
+  local log_file=""
+  while IFS= read -r p; do
+    local plabel
+    plabel=$(plutil -extract Label raw -o - "$p" 2>/dev/null || true)
+    if [[ "$plabel" == "$label" ]]; then
+      log_file=$(plutil -extract StandardOutPath raw -o - "$p" 2>/dev/null || true)
+      break
+    fi
+  done < <(scan_toolkit_plists)
+
+  if [[ -z "$log_file" ]]; then
+    log_error "Job not found or no log path: $label"
+    return 1
+  fi
+
+  if [[ ! -f "$log_file" ]]; then
+    log_warn "Log file does not exist yet: $log_file"
+    return 0
+  fi
+
+  echo -e "${DIM}Tailing $log_file (ctrl-c to stop)${NC}"
+  tail -f "$log_file"
+}
+
+cmd_restart() {
+  local label="${1:-}"
+  [[ -z "$label" ]] && { log_error "Usage: cc-jobs restart <label>"; return 1; }
+
+  local plist=""
+  while IFS= read -r p; do
+    local plabel
+    plabel=$(plutil -extract Label raw -o - "$p" 2>/dev/null || true)
+    if [[ "$plabel" == "$label" ]]; then
+      plist="$p"
+      break
+    fi
+  done < <(scan_toolkit_plists)
+
+  if [[ -z "$plist" ]]; then
+    log_error "Job not found: $label"
+    return 1
+  fi
+
+  log_info "Restarting $label..."
+  launchctl unload "$plist" 2>/dev/null || true
+  launchctl load "$plist"
+  log_ok "Restarted $label"
+}
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+${BOLD}cc-jobs${NC} — Toolkit scheduled job visibility
+
+${BOLD}Usage:${NC}
+  cc-jobs [--json]               List all toolkit jobs
+  cc-jobs status <label>         Detailed view of one job
+  cc-jobs logs <label>           Tail the job's log file
+  cc-jobs restart <label>        Unload + reload a job
+
+${BOLD}Discovered jobs match:${NC}
+  ~/Library/LaunchAgents/com.ax.*.plist
+  ~/Library/LaunchAgents/com.claude-toolkit.*.plist
+  crontab entries containing cc- or ax
+EOF
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-list}"
+
+  case "$cmd" in
+    --json)         cmd_list --json ;;
+    list)           shift || true; cmd_list "$@" ;;
+    status)         shift; cmd_status "$@" ;;
+    logs)           shift; cmd_logs "$@" ;;
+    restart)        shift; cmd_restart "$@" ;;
+    help|--help|-h) usage ;;
+    *)
+      # If it looks like a label, treat as status
+      if [[ "$cmd" == com.* ]]; then
+        cmd_status "$cmd"
+      else
+        log_error "Unknown command: $cmd"
+        usage
+        return 1
+      fi
+      ;;
+  esac
+}
+
+main "$@"

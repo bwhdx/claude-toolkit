@@ -40,6 +40,7 @@ install: build ## Build and install to INSTALL_DIR
 	cp cc-monitor/cc-monitor $(INSTALL_DIR)/cc-monitor
 	cp cc-dashboard/cc-dashboard $(INSTALL_DIR)/cc-dashboard
 	ln -sf $(TOOLKIT_DIR)/cc-auth/cc-auth $(INSTALL_DIR)/cc-auth
+	ln -sf $(TOOLKIT_DIR)/cc-jobs/cc-jobs $(INSTALL_DIR)/cc-jobs
 	@echo ""
 	@echo "Installed to $(INSTALL_DIR):"
 	@echo "  cc-auth      (symlink)"

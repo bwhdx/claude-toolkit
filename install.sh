@@ -31,6 +31,9 @@ echo "Building cc-dashboard..."
 echo "Linking cc-auth..."
 ln -sf "$TOOLKIT_DIR/cc-auth/cc-auth" "$INSTALL_DIR/cc-auth"
 
+echo "Linking cc-jobs..."
+ln -sf "$TOOLKIT_DIR/cc-jobs/cc-jobs" "$INSTALL_DIR/cc-jobs"
+
 # Write toolkit discovery env file so consumers can find us
 ENV_DIR="$HOME/.claude-toolkit"
 mkdir -p "$ENV_DIR"
@@ -42,6 +45,7 @@ ENVEOF
 echo ""
 echo "Installed:"
 echo "  cc-auth      → $INSTALL_DIR/cc-auth"
+echo "  cc-jobs      → $INSTALL_DIR/cc-jobs"
 echo "  cc-monitor   → $INSTALL_DIR/cc-monitor"
 echo "  cc-dashboard → $INSTALL_DIR/cc-dashboard"
 echo "  env          → $ENV_DIR/env"
