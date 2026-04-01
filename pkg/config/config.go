@@ -51,21 +51,9 @@ func SessionsDir() string {
 }
 
 // AXDir returns the autonomous-executor directory, if detectable.
-// Checks AX_DIR env var, then common locations.
+// Uses AX_DIR env var only — no hardcoded fallback paths.
 func AXDir() string {
-	if dir := os.Getenv("AX_DIR"); dir != "" {
-		return dir
-	}
-	home, _ := os.UserHomeDir()
-	candidates := []string{
-		filepath.Join(home, "Code", "autonomous-executor"),
-	}
-	for _, c := range candidates {
-		if info, err := os.Stat(filepath.Join(c, "registry.json")); err == nil && !info.IsDir() {
-			return c
-		}
-	}
-	return ""
+	return os.Getenv("AX_DIR")
 }
 
 // AXRegistryPath returns the path to the ax registry.json, or empty string.

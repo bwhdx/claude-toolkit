@@ -6,7 +6,7 @@
     <string>com.claude-toolkit.cc-auth-refresh</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/bwhdx/.local/bin/cc-auth</string>
+        <string>__CC_AUTH_PATH__</string>
         <string>refresh-all</string>
     </array>
     <key>StartInterval</key>

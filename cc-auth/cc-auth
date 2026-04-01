@@ -531,7 +531,7 @@ cmd_schedule() {
       local cc_auth_path
       cc_auth_path=$(command -v cc-auth 2>/dev/null || echo "$CC_AUTH_ROOT/cc-auth")
       mkdir -p "$(dirname "$CC_AUTH_PLIST_DEST")"
-      sed "s|/Users/bwhdx/.local/bin/cc-auth|$cc_auth_path|g" "$plist_src" > "$CC_AUTH_PLIST_DEST"
+      sed "s|__CC_AUTH_PATH__|$cc_auth_path|g" "$plist_src" > "$CC_AUTH_PLIST_DEST"
       launchctl unload "$CC_AUTH_PLIST_DEST" 2>/dev/null || true
       launchctl load "$CC_AUTH_PLIST_DEST"
       log_ok "Token refresh scheduled (every 4 hours)"

@@ -44,21 +44,10 @@ func buildConfig() discovery.Config {
 		IncludeDead: *includeDead,
 	}
 
-	// Auto-detect ax registry
+	// Auto-detect ax registry via AX_DIR env var
 	axDir := os.Getenv("AX_DIR")
 	if axDir == "" {
-		// Try common locations
-		home, _ := os.UserHomeDir()
-		candidates := []string{
-			filepath.Join(home, "Code", "autonomous-executor", "registry.json"),
-			filepath.Join(home, ".ax", "registry.json"),
-		}
-		for _, c := range candidates {
-			if _, err := os.Stat(c); err == nil {
-				cfg.AXRegistryPath = c
-				break
-			}
-		}
+		// No env var set — ax integration disabled
 	} else {
 		cfg.AXRegistryPath = filepath.Join(axDir, "registry.json")
 	}

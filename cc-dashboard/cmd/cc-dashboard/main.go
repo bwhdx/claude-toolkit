@@ -431,19 +431,12 @@ func formatDuration(seconds int) string {
 func main() {
 	cfg := discovery.Config{}
 
-	// Auto-detect ax registry
-	home, _ := os.UserHomeDir()
-	candidates := []string{
-		filepath.Join(home, "Code", "autonomous-executor", "registry.json"),
-	}
+	// Auto-detect ax registry via AX_DIR env var
 	axDir := os.Getenv("AX_DIR")
 	if axDir != "" {
-		candidates = append([]string{filepath.Join(axDir, "registry.json")}, candidates...)
-	}
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			cfg.AXRegistryPath = c
-			break
+		regPath := filepath.Join(axDir, "registry.json")
+		if _, err := os.Stat(regPath); err == nil {
+			cfg.AXRegistryPath = regPath
 		}
 	}
 
