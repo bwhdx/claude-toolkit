@@ -564,7 +564,7 @@ cmd_refresh_all() {
 }
 
 CC_AUTH_PLIST_LABEL="com.claude-toolkit.cc-auth-refresh"
-CC_AUTH_REFRESH_INTERVAL=14400  # 4 hours
+CC_AUTH_REFRESH_INTERVAL="${CC_AUTH_REFRESH_INTERVAL:-7200}"  # 2 hours (tokens last ~7h)
 CC_AUTH_REFRESH_LOG="/tmp/cc-auth-refresh.log"
 
 cmd_schedule() {
