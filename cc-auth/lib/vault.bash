@@ -227,7 +227,7 @@ state_clear_expired() {
     --argjson now "$now" \
     '.accounts |= with_entries(
       if (.value.limited_until // 0) <= $now and (.value.limited_until // 0) > 0
-      then .value.limited_until = null
+      then .value.limited_until = null | .value.utilization = null | .value.resets_at = null
       else . end
     )'
 }
