@@ -237,5 +237,33 @@ state_init_account() {
   local name="$1"
   json_edit "$CC_AUTH_STATE_FILE" \
     --arg name "$name" \
-    'if .accounts[$name] then . else .accounts[$name] = {limited_until: null, last_used: null} end'
+    'if .accounts[$name] then . else .accounts[$name] = {limited_until: null, last_used: null, utilization: null, utilization_updated: null} end'
+}
+
+# Update rate limit utilization for an account (from stream-json rate_limit_event).
+# Args: $1 = name, $2 = utilization (0.0-1.0), $3 = resets_at (epoch), $4 = using_overage (true/false)
+state_update_utilization() {
+  local name="$1" util="$2" resets="${3:-0}" overage="${4:-false}"
+  json_edit "$CC_AUTH_STATE_FILE" \
+    --arg name "$name" \
+    --argjson util "$util" \
+    --argjson resets "$resets" \
+    --argjson overage "$overage" \
+    --arg updated "$(now_iso)" \
+    '.accounts[$name].utilization = $util |
+     .accounts[$name].resets_at = $resets |
+     .accounts[$name].using_overage = $overage |
+     .accounts[$name].utilization_updated = $updated'
+}
+
+# Get utilization for an account (0.0-1.0, or 999 if unknown).
+state_get_utilization() {
+  local name="$1"
+  local util
+  util=$(jq -r --arg name "$name" '.accounts[$name].utilization // empty' "$CC_AUTH_STATE_FILE" 2>/dev/null)
+  if [[ -n "$util" && "$util" != "null" ]]; then
+    echo "$util"
+  else
+    echo "999"  # unknown = highest priority to avoid
+  fi
 }

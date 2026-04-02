@@ -17,7 +17,7 @@ cycle_account() {
   local current
   current=$(state_active_account)
 
-  # Build ordered list: accounts after current, then wrap around
+  # Build candidate list: all accounts except current, not limited
   local -a all_names=()
   while IFS= read -r name; do
     [[ -n "$name" ]] && all_names+=("$name")
@@ -28,36 +28,52 @@ cycle_account() {
     return 1
   fi
 
-  # Find current index and build rotation starting after it
+  # Filter out limited accounts, collect with utilization
   local -a candidates=()
-  local found_current=false
+  local -a utils=()
   for name in "${all_names[@]}"; do
-    if [[ "$found_current" == "true" ]]; then
-      candidates+=("$name")
-    fi
-    if [[ "$name" == "$current" ]]; then
-      found_current=true
-    fi
-  done
-  # Wrap around: add accounts before (and including) current
-  for name in "${all_names[@]}"; do
-    [[ "$name" == "$current" ]] && break
-    candidates+=("$name")
-  done
-
-  # Try each candidate, skip limited ones
-  for name in "${candidates[@]}"; do
+    [[ "$name" == "$current" ]] && continue
     if state_is_limited "$name"; then
       local remaining
       remaining=$(state_limit_remaining "$name")
       log_dim "$name — limited ($(format_duration "$remaining") remaining)"
       continue
     fi
+    candidates+=("$name")
+    utils+=("$(state_get_utilization "$name")")
+  done
 
-    # Try to activate this account
+  # Sort candidates by utilization (lowest first) — intelligent cycling
+  if [[ ${#candidates[@]} -gt 1 ]]; then
+    local -a sorted_indices=()
+    for i in "${!candidates[@]}"; do sorted_indices+=("$i"); done
+    # Simple selection sort by utilization
+    for ((i=0; i<${#sorted_indices[@]}-1; i++)); do
+      for ((j=i+1; j<${#sorted_indices[@]}; j++)); do
+        local ui="${utils[${sorted_indices[$i]}]}" uj="${utils[${sorted_indices[$j]}]}"
+        if awk "BEGIN{exit !($uj < $ui)}" 2>/dev/null; then
+          local tmp="${sorted_indices[$i]}"
+          sorted_indices[$i]="${sorted_indices[$j]}"
+          sorted_indices[$j]="$tmp"
+        fi
+      done
+    done
+    local -a sorted_candidates=()
+    for idx in "${sorted_indices[@]}"; do sorted_candidates+=("${candidates[$idx]}"); done
+    candidates=("${sorted_candidates[@]}")
+  fi
+
+  # Try each candidate, lowest utilization first
+  for name in ${candidates[@]+"${candidates[@]}"}; do
+    local util
+    util=$(state_get_utilization "$name")
+    if [[ "$util" != "999" ]]; then
+      log_dim "$name — utilization $(awk "BEGIN{printf \"%.0f\", $util * 100}")%"
+    fi
+
     if _do_activate "$name"; then
-      log_ok "Cycled: $current → $name"
-      emit_event "$CC_AUTH_DIR" "account_cycled" "from=$current" "to=$name"
+      log_ok "Cycled: $current → $name (lowest utilization)"
+      emit_event "$CC_AUTH_DIR" "account_cycled" "from=$current" "to=$name" "strategy=lowest_utilization"
       return 0
     else
       log_warn "Failed to activate $name, trying next..."

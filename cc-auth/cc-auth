@@ -275,6 +275,50 @@ cmd_mark_limited() {
   emit_event "$CC_AUTH_DIR" "limit_marked" "name=$name" "seconds=$secs"
 }
 
+# Update rate limit utilization for an account from a worker's stream-json output.
+# Called by consumers (like ax) after each worker completes.
+# Args: <account> <raw_file>  OR  <account> --utilization <0.0-1.0> --resets <epoch>
+cmd_update_utilization() {
+  local name="${1:-}"; shift || true
+  [[ -z "$name" ]] && { log_error "Usage: cc-auth update-utilization <account> <raw_file>"; return 1; }
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+
+  local util="" resets="0" overage="false"
+
+  if [[ "${1:-}" == "--utilization" ]]; then
+    # Direct values
+    util="${2:-}"; shift 2 || true
+    [[ "${1:-}" == "--resets" ]] && { resets="${2:-0}"; shift 2 || true; }
+    [[ "${1:-}" == "--overage" ]] && { overage="${2:-false}"; shift 2 || true; }
+  elif [[ -f "${1:-}" ]]; then
+    # Parse from raw stream-json file
+    local raw_file="$1"
+    local rl_json
+    rl_json=$(claude_parse_rate_limit_info "$raw_file")
+    util=$(echo "$rl_json" | jq -r '.utilization // empty' 2>/dev/null)
+    resets=$(echo "$rl_json" | jq -r '.resets_at // 0' 2>/dev/null)
+    overage=$(echo "$rl_json" | jq -r '.using_overage // false' 2>/dev/null)
+  else
+    log_error "Usage: cc-auth update-utilization <account> <raw_file>"
+    log_error "   or: cc-auth update-utilization <account> --utilization 0.86 --resets 1775221200"
+    return 1
+  fi
+
+  if [[ -z "$util" || "$util" == "null" ]]; then
+    log_dim "No rate limit data in output — skipping"
+    return 0
+  fi
+
+  state_update_utilization "$name" "$util" "$resets" "$overage"
+  local pct; pct=$(awk "BEGIN{printf \"%.0f\", $util * 100}")
+  log_dim "$name: utilization ${pct}%"
+
+  # Proactive warning at >90%
+  if awk "BEGIN{exit !($util > 0.9)}" 2>/dev/null; then
+    log_warn "$name at ${pct}% — approaching limit, consider cycling"
+  fi
+}
+
 cmd_has_available() {
   vault_is_initialized || return 1
   has_available_account
@@ -627,6 +671,7 @@ main() {
     status)         cmd_status "$@" ;;
     refresh)        cmd_refresh "$@" ;;
     refresh-all)    cmd_refresh_all "$@" ;;
+    update-utilization) cmd_update_utilization "$@" ;;
     schedule)       cmd_schedule "$@" ;;
     help|--help|-h) usage ;;
     *)              log_error "Unknown command: $cmd"; usage; return 1 ;;
