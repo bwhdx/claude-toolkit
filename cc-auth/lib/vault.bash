@@ -85,6 +85,44 @@ vault_delete() {
   local name="$1"
   local enc_file="$CC_AUTH_VAULT_DIR/${name}.enc"
   rm -f "$enc_file"
+  rm -f "$CC_AUTH_VAULT_DIR/${name}.longterm.enc"
+}
+
+# ── Long-term token storage ───────────────────────────────────────────────────
+
+# Store a long-term token (from claude setup-token) for an account.
+# Args: $1 = account name, $2 = token string
+vault_write_longterm() {
+  local name="$1" token="$2"
+  local enc_file="$CC_AUTH_VAULT_DIR/${name}.longterm.enc"
+  echo "$token" | openssl enc -aes-256-cbc -salt -pbkdf2 \
+    -pass "file:$CC_AUTH_VAULT_KEY" \
+    -out "$enc_file" 2>/dev/null || {
+    log_error "Failed to encrypt longterm token for '$name'"
+    return 1
+  }
+  chmod 600 "$enc_file"
+}
+
+# Read a long-term token for an account.
+# Args: $1 = account name
+# Returns: token on stdout, or empty + exit 1
+vault_read_longterm() {
+  local name="$1"
+  local enc_file="$CC_AUTH_VAULT_DIR/${name}.longterm.enc"
+  [[ -f "$enc_file" ]] || return 1
+  openssl enc -d -aes-256-cbc -pbkdf2 \
+    -pass "file:$CC_AUTH_VAULT_KEY" \
+    -in "$enc_file" 2>/dev/null || {
+    log_error "Failed to decrypt longterm token for '$name'"
+    return 1
+  }
+}
+
+# Check if an account has a long-term token.
+vault_has_longterm() {
+  local name="$1"
+  [[ -f "$CC_AUTH_VAULT_DIR/${name}.longterm.enc" ]]
 }
 
 # Check if a vault entry exists

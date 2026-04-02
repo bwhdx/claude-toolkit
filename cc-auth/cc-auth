@@ -324,6 +324,42 @@ cmd_has_available() {
   has_available_account
 }
 
+cmd_setup_longterm() {
+  local name="${1:-}" token="${2:-}"
+  [[ -z "$name" ]] && { log_error "Usage: cc-auth setup-longterm <name> <token>"; return 1; }
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  accounts_name_exists "$name" || { log_error "Unknown account: $name"; return 1; }
+
+  if [[ -z "$token" ]]; then
+    # Read from stdin if not passed as arg (for piping)
+    echo "Paste the token from 'claude setup-token' (then press Enter):"
+    read -r token
+  fi
+
+  [[ -z "$token" ]] && { log_error "No token provided"; return 1; }
+
+  vault_write_longterm "$name" "$token"
+  log_ok "Stored long-term token for '$name'"
+  emit_event "$CC_AUTH_DIR" "longterm_token_stored" "name=$name"
+}
+
+cmd_get_token() {
+  vault_is_initialized || return 1
+  local name
+  name=$(state_active_account)
+  [[ -z "$name" ]] && { log_error "No active account"; return 1; }
+
+  # Prefer long-term token, fall back to OAuth access token
+  if vault_has_longterm "$name"; then
+    vault_read_longterm "$name"
+  else
+    # Fall back to OAuth access token from vault
+    local cred
+    cred=$(vault_read "$name") || return 1
+    echo "$cred" | jq -r '.claudeAiOauth.accessToken // empty'
+  fi
+}
+
 cmd_active_name() {
   vault_is_initialized || return 1
   local name
@@ -633,6 +669,10 @@ ${BOLD}Status:${NC}
   verify [<name>|--all]         Check token validity
   active-name                   Print active account name
 
+${BOLD}Long-term tokens:${NC}
+  setup-longterm <name> <token>  Store a 1-year token from claude setup-token
+  get-token                      Print active account's long-term token (for env var)
+
 ${BOLD}Rate limiting:${NC}
   mark-limited <name> <secs>    Record subscription limit for account
   has-available                  Exit 0 if any account is available
@@ -672,6 +712,8 @@ main() {
     refresh)        cmd_refresh "$@" ;;
     refresh-all)    cmd_refresh_all "$@" ;;
     update-utilization) cmd_update_utilization "$@" ;;
+    setup-longterm) cmd_setup_longterm "$@" ;;
+    get-token)      cmd_get_token "$@" ;;
     schedule)       cmd_schedule "$@" ;;
     help|--help|-h) usage ;;
     *)              log_error "Unknown command: $cmd"; usage; return 1 ;;
