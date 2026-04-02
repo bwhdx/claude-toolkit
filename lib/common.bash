@@ -34,9 +34,14 @@ log_fatal() { log_error "$@"; exit 1; }
 
 # ── JSON helpers (requires jq) ────────────────────────────────────────────────
 
-# Atomic JSON write: write to temp, then mv (prevents partial reads)
+# Atomic JSON write: validate, write to temp, then mv (prevents partial reads and corruption)
 json_write() {
   local file="$1" content="$2"
+  # Validate JSON before writing
+  if ! echo "$content" | jq empty 2>/dev/null; then
+    log_error "json_write: invalid JSON for $file"
+    return 1
+  fi
   local tmp="${file}.tmp.$$"
   printf '%s\n' "$content" > "$tmp" && mv -f "$tmp" "$file"
 }
@@ -163,6 +168,82 @@ release_lock() {
 
   # Remove mkdir lockdir if it exists
   rm -rf "$lockdir"
+}
+
+# ── Portable timeout ──────────────────────────────────────────────────────────
+
+# Run a command with a timeout (portable across macOS/Linux).
+# Tries: timeout (GNU) → gtimeout (Homebrew coreutils) → bash fallback.
+# Usage: run_with_timeout 30 some_command --flag
+run_with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  else
+    # Portable fallback: fork command, kill after timeout
+    (
+      "$@" &
+      local cmd_pid=$!
+      ( sleep "$secs" && kill "$cmd_pid" 2>/dev/null ) &
+      local timer_pid=$!
+      wait "$cmd_pid" 2>/dev/null
+      local rc=$?
+      kill "$timer_pid" 2>/dev/null; wait "$timer_pid" 2>/dev/null
+      exit $rc
+    )
+  fi
+}
+
+# ── ISO 8601 parsing ─────────────────────────────────────────────────────────
+
+# Cross-platform ISO 8601 → epoch seconds conversion.
+# Handles BSD date (macOS) and GNU date (Linux).
+# Usage: parse_iso_epoch "2026-04-01T12:00:00Z"
+parse_iso_epoch() {
+  local ts="$1"
+  ts="${ts%%.*}"          # strip .NNN milliseconds if present
+  ts="${ts%%Z*}"          # strip trailing Z or timezone
+  ts="${ts%%+*}"          # strip +00:00 offset if present
+  if date --version >/dev/null 2>&1; then
+    TZ=UTC date -d "$ts" "+%s" 2>/dev/null || echo 0
+  else
+    TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$ts" "+%s" 2>/dev/null || echo 0
+  fi
+}
+
+# ── Log rotation ─────────────────────────────────────────────────────────────
+
+# Rotate old log files in a directory. Keeps the newest N files per extension.
+# Also trims JSONL files to the last N lines.
+# Usage: rotate_logs "/path/to/logs" [max_files] [max_jsonl_lines]
+rotate_logs() {
+  local logs_dir="$1"
+  local max_files="${2:-50}"
+  local max_lines="${3:-1000}"
+
+  [[ -d "$logs_dir" ]] || return 0
+
+  for dir in "$logs_dir"/*/; do
+    [[ -d "$dir" ]] || continue
+    for ext in md json out; do
+      local count
+      count=$(find "$dir" -maxdepth 1 -name "*.$ext" 2>/dev/null | wc -l | tr -d ' ')
+      if [[ "$count" -gt "$max_files" ]]; then
+        find "$dir" -maxdepth 1 -name "*.$ext" -print0 | xargs -0 ls -t | tail -n +$(( max_files + 1 )) | xargs rm -f
+      fi
+    done
+    for jsonl in "$dir"/*.jsonl; do
+      [[ -f "$jsonl" ]] || continue
+      local lines
+      lines=$(wc -l < "$jsonl" | tr -d ' ')
+      if [[ "$lines" -gt "$max_lines" ]]; then
+        local tmp; tmp=$(mktemp)
+        tail -"$max_lines" "$jsonl" > "$tmp" && mv "$tmp" "$jsonl"
+      fi
+    done
+  done
 }
 
 # ── Dependency check ──────────────────────────────────────────────────────────
