@@ -213,6 +213,34 @@ claude_auth_email() {
   claude auth status 2>/dev/null | jq -r '.email // empty'
 }
 
+# ── Reset time extraction ─────────────────────────────────────────────────────
+
+# Get seconds until rate limit resets, using the BEST available source:
+# 1. rate_limit_event.resetsAt epoch (most precise — exact time from API)
+# 2. "resets Xam/Xpm" text pattern (fallback — parsed from error message)
+# 3. 14400 (4h default if nothing parseable)
+# Args: $1 = raw stream-json file
+claude_reset_wait_seconds() {
+  local raw_file="${1:-}"
+  [[ -n "$raw_file" && -f "$raw_file" ]] || { echo "14400"; return; }
+
+  # Best source: rate_limit_event.rate_limit_info.resetsAt (epoch seconds)
+  local resets_at
+  resets_at=$(grep '"rate_limit_event"' "$raw_file" 2>/dev/null | tail -1 | \
+    jq -r '.rate_limit_info.resetsAt // empty' 2>/dev/null)
+  if [[ -n "$resets_at" && "$resets_at" != "null" && "$resets_at" -gt 0 ]] 2>/dev/null; then
+    local now
+    now=$(now_epoch)
+    local wait=$(( resets_at - now ))
+    [[ "$wait" -lt 0 ]] && wait=0
+    echo "$wait"
+    return
+  fi
+
+  # Fallback: parse "resets Xam/pm" from error text
+  claude_subscription_reset_wait "$raw_file"
+}
+
 # ── Stream-JSON intelligence ─────────────────────────────────────────────────
 # These functions parse Claude Code's --output-format stream-json output
 # to extract rich operational data. Any consumer can use these.
