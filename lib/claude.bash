@@ -20,8 +20,45 @@ claude_extract_result() {
 # Args: $1 = raw output file
 # Returns: session ID on stdout, or empty
 claude_extract_session_id() {
-  local raw_file="$1"
+  local raw_file="${1:-}"
+  [[ -n "$raw_file" && -f "$raw_file" ]] || return 0
   grep -o '"session_id":"[^"]*"' "$raw_file" 2>/dev/null | tail -1 | sed 's/"session_id":"//;s/"//'
+}
+
+# Extract total cost (USD) from an extracted result JSON file.
+# Args: $1 = result JSON file (output of claude_extract_result)
+# Returns: cost as number on stdout (0 if unavailable)
+claude_extract_cost() {
+  local result_file="${1:-}"
+  [[ -n "$result_file" && -f "$result_file" ]] || { echo "0"; return; }
+  jq -r '.total_cost_usd // 0' "$result_file" 2>/dev/null || echo "0"
+}
+
+# Extract duration (milliseconds) from an extracted result JSON file.
+# Args: $1 = result JSON file (output of claude_extract_result)
+# Returns: duration in ms on stdout (0 if unavailable)
+claude_extract_duration() {
+  local result_file="${1:-}"
+  [[ -n "$result_file" && -f "$result_file" ]] || { echo "0"; return; }
+  jq -r '.duration_ms // 0' "$result_file" 2>/dev/null || echo "0"
+}
+
+# Check if a result JSON indicates an error.
+# Args: $1 = result JSON file (output of claude_extract_result)
+# Returns: 0 if error, 1 if success
+claude_is_error() {
+  local result_file="${1:-}"
+  [[ -n "$result_file" && -f "$result_file" ]] || return 0
+  jq -e '.is_error == true' "$result_file" >/dev/null 2>&1
+}
+
+# Extract the result text/summary from a result JSON file.
+# Args: $1 = result JSON file
+# Returns: result text on stdout
+claude_extract_result_text() {
+  local result_file="${1:-}"
+  [[ -n "$result_file" && -f "$result_file" ]] || { echo "No output"; return; }
+  jq -r '.result // "No output"' "$result_file" 2>/dev/null || cat "$result_file"
 }
 
 # ── Rate limit detection ─────────────────────────────────────────────────────
