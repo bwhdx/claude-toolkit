@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# cc-auth cycling logic — account selection, round-robin cycling, availability checks
+# cc-auth cycling logic — account selection, deterministic cycling, availability checks
 
-# Cycle to the next available account (round-robin, skipping limited accounts)
+# Cycle to the next available account.
+# Strategy: if utilization data exists, pick lowest utilization.
+# Otherwise, deterministic round-robin (next after current, wrapping around).
 # Returns: 0 on success (new account activated), 1 if no accounts available
 cycle_account() {
-  # Acquire cycle lock to prevent concurrent swaps
   if ! acquire_lock "$CC_AUTH_LOCK_DIR" 60; then
     log_error "Another cycle operation is in progress"
     return 1
   fi
-  trap 'release_lock "$CC_AUTH_LOCK_DIR"' RETURN
 
   # Clear any expired limits first
   state_clear_expired
@@ -17,7 +17,7 @@ cycle_account() {
   local current
   current=$(state_active_account)
 
-  # Build candidate list: all accounts except current, not limited
+  # Build full account list
   local -a all_names=()
   while IFS= read -r name; do
     [[ -n "$name" ]] && all_names+=("$name")
@@ -25,13 +25,13 @@ cycle_account() {
 
   if [[ ${#all_names[@]} -lt 2 ]]; then
     log_error "Need at least 2 accounts to cycle (have ${#all_names[@]})"
+    release_lock "$CC_AUTH_LOCK_DIR"
     return 1
   fi
 
-  # Filter out limited accounts, collect with utilization
+  # Build candidates: not current, not limited
   local -a candidates=()
-  local -a utils=()
-  for name in "${all_names[@]}"; do
+  for name in ${all_names[@]+"${all_names[@]}"}; do
     [[ "$name" == "$current" ]] && continue
     if state_is_limited "$name"; then
       local remaining
@@ -40,40 +40,50 @@ cycle_account() {
       continue
     fi
     candidates+=("$name")
-    utils+=("$(state_get_utilization "$name")")
   done
 
-  # Sort candidates by utilization (lowest first) — intelligent cycling
-  if [[ ${#candidates[@]} -gt 1 ]]; then
-    local -a sorted_indices=()
-    for i in "${!candidates[@]}"; do sorted_indices+=("$i"); done
-    # Simple selection sort by utilization
-    for ((i=0; i<${#sorted_indices[@]}-1; i++)); do
-      for ((j=i+1; j<${#sorted_indices[@]}; j++)); do
-        local ui="${utils[${sorted_indices[$i]}]}" uj="${utils[${sorted_indices[$j]}]}"
-        if awk "BEGIN{exit !($uj < $ui)}" 2>/dev/null; then
-          local tmp="${sorted_indices[$i]}"
-          sorted_indices[$i]="${sorted_indices[$j]}"
-          sorted_indices[$j]="$tmp"
-        fi
-      done
-    done
-    local -a sorted_candidates=()
-    for idx in "${sorted_indices[@]}"; do sorted_candidates+=("${candidates[$idx]}"); done
-    candidates=("${sorted_candidates[@]}")
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    log_error "All accounts are limited or failed to activate"
+    release_lock "$CC_AUTH_LOCK_DIR"
+    return 1
   fi
 
-  # Try each candidate, lowest utilization first
-  for name in ${candidates[@]+"${candidates[@]}"}; do
+  # Deterministic round-robin: always pick the NEXT available account after current.
+  # This guarantees every account gets used before any account is reused.
+  # Utilization data is logged for visibility but doesn't affect order.
+  local -a ordered=()
+  local found_current=false
+  # Start after current, wrap around
+  for name in ${all_names[@]+"${all_names[@]}"}; do
+    if [[ "$found_current" == "true" ]]; then
+      for c in ${candidates[@]+"${candidates[@]}"}; do
+        [[ "$c" == "$name" ]] && ordered+=("$name") && break
+      done
+    fi
+    [[ "$name" == "$current" ]] && found_current=true
+  done
+  # Wrap around: accounts before current
+  for name in ${all_names[@]+"${all_names[@]}"}; do
+    [[ "$name" == "$current" ]] && break
+    for c in ${candidates[@]+"${candidates[@]}"}; do
+      [[ "$c" == "$name" ]] && ordered+=("$name") && break
+    done
+  done
+
+  # Try each candidate in order
+  for name in ${ordered[@]+"${ordered[@]}"}; do
     local util
     util=$(state_get_utilization "$name")
     if [[ "$util" != "999" ]]; then
-      log_dim "$name — utilization $(awk "BEGIN{printf \"%.0f\", $util * 100}")%"
+      local pct
+      pct=$(printf '%.0f' "$(echo "$util * 100" | bc 2>/dev/null || echo "?")")
+      log_dim "$name — utilization ${pct}%"
     fi
 
     if _do_activate "$name"; then
-      log_ok "Cycled: $current → $name (lowest utilization)"
-      emit_event "$CC_AUTH_DIR" "account_cycled" "from=$current" "to=$name" "strategy=lowest_utilization"
+      log_ok "Cycled: $current → $name"
+      emit_event "$CC_AUTH_DIR" "account_cycled" "from=$current" "to=$name"
+      release_lock "$CC_AUTH_LOCK_DIR"
       return 0
     else
       log_warn "Failed to activate $name, trying next..."
@@ -81,6 +91,7 @@ cycle_account() {
   done
 
   log_error "All accounts are limited or failed to activate"
+  release_lock "$CC_AUTH_LOCK_DIR"
   return 1
 }
 
@@ -94,14 +105,15 @@ activate_account() {
     return 1
   fi
 
-  # Acquire cycle lock
   if ! acquire_lock "$CC_AUTH_LOCK_DIR" 60; then
     log_error "Another cycle operation is in progress"
     return 1
   fi
-  trap 'release_lock "$CC_AUTH_LOCK_DIR"' RETURN
 
   _do_activate "$name"
+  local rc=$?
+  release_lock "$CC_AUTH_LOCK_DIR"
+  return $rc
 }
 
 # Internal: perform the actual activation (swap keychain + verify)
@@ -156,34 +168,4 @@ has_available_account() {
 # Get the name of the currently active account
 get_active_name() {
   state_active_account
-}
-
-# Get the next account that would be cycled to (without actually cycling)
-get_next_available() {
-  state_clear_expired
-  local current
-  current=$(state_active_account)
-
-  local -a all_names=()
-  while IFS= read -r name; do
-    [[ -n "$name" ]] && all_names+=("$name")
-  done < <(accounts_list_names)
-
-  local found_current=false
-  for name in "${all_names[@]}"; do
-    if [[ "$found_current" == "true" ]] && ! state_is_limited "$name"; then
-      echo "$name"
-      return 0
-    fi
-    [[ "$name" == "$current" ]] && found_current=true
-  done
-  # Wrap around
-  for name in "${all_names[@]}"; do
-    [[ "$name" == "$current" ]] && return 1
-    if ! state_is_limited "$name"; then
-      echo "$name"
-      return 0
-    fi
-  done
-  return 1
 }
