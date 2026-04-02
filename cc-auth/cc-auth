@@ -21,10 +21,10 @@ source "$CC_TOOLKIT_ROOT/lib/common.bash"
 source "$CC_TOOLKIT_ROOT/lib/events.bash"
 source "$CC_TOOLKIT_ROOT/lib/scheduler.bash"
 source "$CC_TOOLKIT_ROOT/lib/process.bash"
+source "$CC_TOOLKIT_ROOT/lib/claude.bash"
 source "$CC_AUTH_ROOT/lib/keychain.bash"
 source "$CC_AUTH_ROOT/lib/vault.bash"
 source "$CC_AUTH_ROOT/lib/cycling.bash"
-source "$CC_AUTH_ROOT/lib/detect.bash"
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
