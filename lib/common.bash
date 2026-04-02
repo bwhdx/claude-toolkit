@@ -66,7 +66,7 @@ now_epoch() { date +%s; }
 
 # Format seconds as human-readable duration
 format_duration() {
-  local secs="$1"
+  local secs="${1:-0}"
   if [[ "$secs" -lt 60 ]]; then
     echo "${secs}s"
   elif [[ "$secs" -lt 3600 ]]; then
@@ -219,11 +219,11 @@ parse_iso_epoch() {
 # Also trims JSONL files to the last N lines.
 # Usage: rotate_logs "/path/to/logs" [max_files] [max_jsonl_lines]
 rotate_logs() {
-  local logs_dir="$1"
+  local logs_dir="${1:-}"
   local max_files="${2:-50}"
   local max_lines="${3:-1000}"
 
-  [[ -d "$logs_dir" ]] || return 0
+  [[ -n "$logs_dir" && -d "$logs_dir" ]] || return 0
 
   for dir in "$logs_dir"/*/; do
     [[ -d "$dir" ]] || continue

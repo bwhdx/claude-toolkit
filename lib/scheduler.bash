@@ -138,7 +138,9 @@ _scheduler_install_launchd() {
 ${prog_args}    </array>
     <key>StartInterval</key>
     <integer>${interval}</integer>
-${log_entries}${env_block}    <key>RunAtLoad</key>
+${log_entries}${env_block}    <key>AbandonProcessGroup</key>
+    <true/>
+    <key>RunAtLoad</key>
     <false/>
 </dict>
 </plist>

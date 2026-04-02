@@ -175,3 +175,88 @@ claude_auth_status() {
 claude_auth_email() {
   claude auth status 2>/dev/null | jq -r '.email // empty'
 }
+
+# ── Stream-JSON intelligence ─────────────────────────────────────────────────
+# These functions parse Claude Code's --output-format stream-json output
+# to extract rich operational data. Any consumer can use these.
+
+# Parse rate limit info from stream output.
+# Returns: JSON with utilization, reset time, overage status.
+# Args: $1 = raw stream-json file
+claude_parse_rate_limit_info() {
+  local raw_file="${1:-}"
+  [[ -n "$raw_file" && -f "$raw_file" ]] || { echo '{}'; return; }
+  local info
+  info=$(grep '"rate_limit_event"' "$raw_file" 2>/dev/null | tail -1 | jq -r '.rate_limit_info // empty' 2>/dev/null)
+  if [[ -n "$info" ]]; then
+    echo "$info" | jq '{
+      utilization: .utilization,
+      resets_at: .resetsAt,
+      rate_limit_type: .rateLimitType,
+      using_overage: (.isUsingOverage // false),
+      status: .status,
+      threshold: (.surpassedThreshold // null)
+    }' 2>/dev/null
+  else
+    echo '{}'
+  fi
+}
+
+# Parse tool use summary from stream output.
+# Returns: JSON object with tool names as keys, counts as values.
+# Args: $1 = raw stream-json file
+claude_parse_tool_summary() {
+  local raw_file="${1:-}"
+  [[ -n "$raw_file" && -f "$raw_file" ]] || { echo '{}'; return; }
+  jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "tool_use") | .name' \
+    "$raw_file" 2>/dev/null | sort | uniq -c | sort -rn | \
+    awk 'BEGIN{printf "{"} NR>1{printf ","} {gsub(/"/,"",$2); printf "\"%s\":%d",$2,$1} END{printf "}"}' 2>/dev/null || echo '{}'
+}
+
+# Parse list of files touched (read, edited, or written) from stream output.
+# Returns: JSON array of relative file paths (deduped).
+# Args: $1 = raw stream-json file, $2 = optional repo root to strip
+claude_parse_files_touched() {
+  local raw_file="${1:-}" repo_root="${2:-}"
+  [[ -n "$raw_file" && -f "$raw_file" ]] || { echo '[]'; return; }
+  local files
+  files=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "tool_use") |
+    select(.name == "Read" or .name == "Edit" or .name == "Write" or .name == "Grep" or .name == "Glob") |
+    .input.file_path // .input.path // empty' "$raw_file" 2>/dev/null | sort -u)
+  if [[ -n "$repo_root" ]]; then
+    files=$(echo "$files" | sed "s|^${repo_root}/||")
+  fi
+  echo "$files" | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null || echo '[]'
+}
+
+# Parse list of files modified (Edit or Write only) from stream output.
+# Returns: JSON array of file paths (deduped).
+# Args: $1 = raw stream-json file, $2 = optional repo root to strip
+claude_parse_files_edited() {
+  local raw_file="${1:-}" repo_root="${2:-}"
+  [[ -n "$raw_file" && -f "$raw_file" ]] || { echo '[]'; return; }
+  local files
+  files=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "tool_use") |
+    select(.name == "Edit" or .name == "Write") |
+    .input.file_path // empty' "$raw_file" 2>/dev/null | sort -u)
+  if [[ -n "$repo_root" ]]; then
+    files=$(echo "$files" | sed "s|^${repo_root}/||")
+  fi
+  echo "$files" | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null || echo '[]'
+}
+
+# Parse session init metadata from stream output.
+# Returns: JSON with model, version, session_id, tool count.
+# Args: $1 = raw stream-json file
+claude_parse_init_info() {
+  local raw_file="${1:-}"
+  [[ -n "$raw_file" && -f "$raw_file" ]] || { echo '{}'; return; }
+  grep '"subtype":"init"' "$raw_file" 2>/dev/null | head -1 | jq '{
+    model: .model,
+    version: .claude_code_version,
+    session_id: .session_id,
+    cwd: .cwd,
+    tools: (.tools // [] | length),
+    mcp_servers: (.mcp_servers // [] | length)
+  }' 2>/dev/null || echo '{}'
+}
