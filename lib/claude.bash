@@ -144,13 +144,15 @@ claude_subscription_reset_wait() {
 
 # ── Auth failure detection ────────────────────────────────────────────────────
 
-# Check if Claude Code output indicates an authentication failure.
+# Check if Claude Code output indicates an authentication or token failure.
+# Matches: 401 authentication_error, 403 token revoked, invalid API key.
+# Consumers should cycle to the next account when this returns 0.
 # Args: $1 = path to raw output file
 # Returns: 0 if auth failed, 1 if not
 claude_is_auth_failure() {
   local raw_file="$1"
   [[ -f "$raw_file" ]] || return 1
-  grep -qiE '"error":"authentication"|"error":"invalid_api_key"|"error":"unauthorized"|authentication.failed' "$raw_file" 2>/dev/null
+  grep -qiE '"type":"authentication_error"|"type":"permission_error"|"error_status":401|"error_status":403|token has been revoked|Invalid authentication credentials|invalid.api.key|no usable OAuth' "$raw_file" 2>/dev/null
 }
 
 # ── Rate limit cooldown (file-based global state) ────────────────────────────
