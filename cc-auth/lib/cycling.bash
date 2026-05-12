@@ -1,35 +1,40 @@
 #!/usr/bin/env bash
-# cc-auth cycling logic — account selection, deterministic cycling, availability checks
+# cc-auth cycling — pool-aware account selection, activation, and round-robin
+# rotation. All operations are scoped to a single pool; the legacy
+# single-pool world is preserved via the "interactive" pool which is created
+# automatically by pools_migrate_if_needed.
 
-# Cycle to the next available account.
-# Strategy: if utilization data exists, pick lowest utilization.
-# Otherwise, deterministic round-robin (next after current, wrapping around).
-# Returns: 0 on success (new account activated), 1 if no accounts available
-cycle_account() {
+# Cycle to the next available account WITHIN a pool.
+# Strategy: deterministic round-robin among pool members that aren't currently
+# limited (and aren't the pool's current active). Returns 0 on success.
+# Args: $1 = pool name (default: interactive)
+cycle_pool() {
+  local pool="${1:-$POOLS_INTERACTIVE}"
+  pools_exists "$pool" || { log_error "Pool '$pool' does not exist"; return 1; }
+
   if ! acquire_lock "$CC_AUTH_LOCK_DIR" 60; then
     log_error "Another cycle operation is in progress"
     return 1
   fi
 
-  # Clear any expired limits first
   state_clear_expired
 
   local current
-  current=$(state_active_account)
+  current=$(pools_active "$pool")
 
-  # Build full account list
+  # Pool members
   local -a all_names=()
   while IFS= read -r name; do
     [[ -n "$name" ]] && all_names+=("$name")
-  done < <(accounts_list_names)
+  done < <(pools_list_members "$pool")
 
   if [[ ${#all_names[@]} -lt 2 ]]; then
-    log_error "Need at least 2 accounts to cycle (have ${#all_names[@]})"
+    log_error "Pool '$pool' needs at least 2 members to cycle (has ${#all_names[@]})"
     release_lock "$CC_AUTH_LOCK_DIR"
     return 1
   fi
 
-  # Build candidates: not current, not limited
+  # Candidates: in pool, not current, not limited
   local -a candidates=()
   for name in ${all_names[@]+"${all_names[@]}"}; do
     [[ "$name" == "$current" ]] && continue
@@ -43,17 +48,14 @@ cycle_account() {
   done
 
   if [[ ${#candidates[@]} -eq 0 ]]; then
-    log_error "All accounts are limited or failed to activate"
+    log_error "All accounts in pool '$pool' are limited"
     release_lock "$CC_AUTH_LOCK_DIR"
     return 1
   fi
 
-  # Deterministic round-robin: always pick the NEXT available account after current.
-  # This guarantees every account gets used before any account is reused.
-  # Utilization data is logged for visibility but doesn't affect order.
+  # Deterministic round-robin: pick next available after current, wrap around.
   local -a ordered=()
   local found_current=false
-  # Start after current, wrap around
   for name in ${all_names[@]+"${all_names[@]}"}; do
     if [[ "$found_current" == "true" ]]; then
       for c in ${candidates[@]+"${candidates[@]}"}; do
@@ -62,7 +64,6 @@ cycle_account() {
     fi
     [[ "$name" == "$current" ]] && found_current=true
   done
-  # Wrap around: accounts before current
   for name in ${all_names[@]+"${all_names[@]}"}; do
     [[ "$name" == "$current" ]] && break
     for c in ${candidates[@]+"${candidates[@]}"}; do
@@ -70,7 +71,6 @@ cycle_account() {
     done
   done
 
-  # Try each candidate in order
   for name in ${ordered[@]+"${ordered[@]}"}; do
     local util
     util=$(state_get_utilization "$name")
@@ -80,9 +80,9 @@ cycle_account() {
       log_dim "$name — utilization ${pct}%"
     fi
 
-    if _do_activate "$name"; then
-      log_ok "Cycled: $current → $name"
-      emit_event "$CC_AUTH_DIR" "account_cycled" "from=$current" "to=$name"
+    if _do_activate_in_pool "$pool" "$name"; then
+      log_ok "Cycled in pool '$pool': $current → $name"
+      emit_event "$CC_AUTH_DIR" "account_cycled" "pool=$pool" "from=$current" "to=$name"
       release_lock "$CC_AUTH_LOCK_DIR"
       return 0
     else
@@ -90,82 +90,85 @@ cycle_account() {
     fi
   done
 
-  log_error "All accounts are limited or failed to activate"
+  log_error "All accounts in pool '$pool' failed to activate"
   release_lock "$CC_AUTH_LOCK_DIR"
   return 1
 }
 
-# Activate a specific account by name
-# Args: $1 = account name
-activate_account() {
-  local name="$1"
-
-  if ! accounts_name_exists "$name"; then
-    log_error "Unknown account: $name"
+# Activate a specific account within a pool.
+# Args: $1 = pool, $2 = account name
+activate_in_pool() {
+  local pool="$1" name="$2"
+  pools_exists "$pool" || { log_error "Pool '$pool' does not exist"; return 1; }
+  pools_is_member "$pool" "$name" || {
+    log_error "Account '$name' is not a member of pool '$pool'"
+    log_dim "Hint: cc-auth pool add $pool $name"
     return 1
-  fi
-
+  }
   if ! acquire_lock "$CC_AUTH_LOCK_DIR" 60; then
     log_error "Another cycle operation is in progress"
     return 1
   fi
-
-  _do_activate "$name"
+  _do_activate_in_pool "$pool" "$name"
   local rc=$?
   release_lock "$CC_AUTH_LOCK_DIR"
   return $rc
 }
 
-# Internal: perform the actual activation (swap keychain + verify)
-# Caller must hold the cycle lock
-_do_activate() {
-  local name="$1"
+# Internal: activate an account within a pool. Updates pool's active pointer;
+# writes keychain only if pool.writes_keychain=true. Caller must hold cycle lock.
+_do_activate_in_pool() {
+  local pool="$1" name="$2"
 
-  # Read credentials from vault
-  local cred_json
-  cred_json=$(vault_read "$name") || return 1
+  if pools_writes_keychain "$pool"; then
+    # Interactive-style: swap keychain entry so Claude Code picks it up.
+    local cred_json
+    cred_json=$(vault_read "$name") || return 1
 
-  # Check if token is expired
-  if keychain_cred_expired "$cred_json"; then
-    log_warn "Token for '$name' appears expired — attempting anyway (Claude Code may refresh it)"
-  fi
+    if keychain_cred_expired "$cred_json"; then
+      log_warn "Token for '$name' appears expired — attempting anyway (Claude Code may refresh it)"
+    fi
 
-  # Swap keychain entry
-  keychain_write "$cred_json" || {
-    log_error "Failed to write credentials for '$name' to keychain"
-    return 1
-  }
+    keychain_write "$cred_json" || {
+      log_error "Failed to write credentials for '$name' to keychain"
+      return 1
+    }
 
-  # Verify the keychain now holds this account's token (token-level comparison)
-  if keychain_verify_token "$cred_json"; then
+    if ! keychain_verify_token "$cred_json"; then
+      log_error "Keychain token mismatch after write for '$name'"
+      return 1
+    fi
+
     local email
     email=$(accounts_get "$name" | jq -r '.email // "?"')
-    state_set_active "$name"
+    pools_set_active "$pool" "$name"
     accounts_touch_verified "$name"
-    log_dim "Verified: $name ($email)"
+    log_dim "Verified: $name ($email) in pool '$pool'"
     return 0
   else
-    log_error "Keychain token mismatch after write for '$name'"
-    return 1
+    # Background-style: long-term tokens are read directly via vault_read_longterm
+    # at get-token time; we just record the pointer. No keychain mutation.
+    if ! vault_has_longterm "$name"; then
+      log_warn "Account '$name' has no long-term token stored (use 'cc-auth setup-longterm $name <token>')"
+      # Don't fail — fallback path uses OAuth access token from vault.
+    fi
+    pools_set_active "$pool" "$name"
+    local email
+    email=$(accounts_get "$name" | jq -r '.email // "?"')
+    log_dim "Active in pool '$pool': $name ($email)"
+    return 0
   fi
 }
 
-# Check if any account is available (not limited)
-# Returns: 0 if at least one is available, 1 if all limited
-has_available_account() {
+# Returns 0 if at least one account in the pool is not limited.
+# Args: $1 = pool (default: interactive)
+has_available_in_pool() {
+  local pool="${1:-$POOLS_INTERACTIVE}"
+  pools_exists "$pool" || return 1
   state_clear_expired
-
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    if ! state_is_limited "$name"; then
-      return 0
-    fi
-  done < <(accounts_list_names)
-
+    state_is_limited "$name" || return 0
+  done < <(pools_list_members "$pool")
   return 1
-}
-
-# Get the name of the currently active account
-get_active_name() {
-  state_active_account
 }

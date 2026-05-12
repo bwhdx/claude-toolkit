@@ -24,7 +24,29 @@ source "$CC_TOOLKIT_ROOT/lib/process.bash"
 source "$CC_TOOLKIT_ROOT/lib/claude.bash"
 source "$CC_AUTH_ROOT/lib/keychain.bash"
 source "$CC_AUTH_ROOT/lib/vault.bash"
+source "$CC_AUTH_ROOT/lib/pools.bash"
 source "$CC_AUTH_ROOT/lib/cycling.bash"
+
+# ── --pool=<name> arg parser ──────────────────────────────────────────────────
+# Extracts --pool/--pool=<name> from positional args. Echoes the pool name on
+# stdout (empty if not specified). Re-emits remaining args as a NUL-separated
+# stream via fd 3 so callers can rebuild their argv preserving values with
+# spaces.
+# Usage:
+#   pool=$(_extract_pool_arg "$@") || return 1
+#   readarray -d '' -t REMAINING < <(_extract_pool_arg_remaining "$@")
+# Simpler form used below: shell-level helper that mutates a global REMAINING array.
+_parse_pool_flag() {
+  POOL_ARG=""
+  REMAINING=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pool=*)   POOL_ARG="${1#--pool=}"; shift ;;
+      --pool)     POOL_ARG="${2:-}"; shift 2 ;;
+      *)          REMAINING+=("$1"); shift ;;
+    esac
+  done
+}
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
@@ -169,14 +191,22 @@ cmd_remove() {
   log_ok "Removed account '$name'"
   emit_event "$CC_AUTH_DIR" "account_removed" "name=$name"
 
+  # Remove from any pool that contains it
+  pools_migrate_if_needed
+  while IFS= read -r pool; do
+    [[ -n "$pool" ]] || continue
+    if pools_is_member "$pool" "$name"; then
+      pools_remove_member "$pool" "$name" || true
+    fi
+  done < <(pools_list_names)
+
   if [[ "$active" == "$name" ]]; then
-    # Clear active, cycle to next if possible
-    json_edit "$CC_AUTH_STATE_FILE" '.active_account = null'
+    # Pick a replacement from the interactive pool
     local next
-    next=$(accounts_list_names | head -1)
+    next=$(pools_list_members "$POOLS_INTERACTIVE" 2>/dev/null | head -1)
     if [[ -n "$next" ]]; then
-      log_info "Activating '$next' as the new active account"
-      _do_activate "$next" || true
+      log_info "Activating '$next' as the new active account (pool: $POOLS_INTERACTIVE)"
+      activate_in_pool "$POOLS_INTERACTIVE" "$next" || true
     fi
   fi
 }
@@ -254,15 +284,25 @@ cmd_list() {
 }
 
 cmd_activate() {
-  local name="$1"
-  [[ -z "$name" ]] && { log_error "Usage: cc-auth activate <name>"; return 1; }
+  _parse_pool_flag "$@"
+  local name="${REMAINING[0]:-}"
+  [[ -z "$name" ]] && { log_error "Usage: cc-auth activate <name> [--pool=<pool>]"; return 1; }
   vault_is_initialized || { log_error "Vault not initialized"; return 1; }
-  activate_account "$name"
+  pools_migrate_if_needed
+
+  local pool="$POOL_ARG"
+  if [[ -z "$pool" ]]; then
+    pool=$(pools_infer_for_account "$name") || return 1
+  fi
+  activate_in_pool "$pool" "$name"
 }
 
 cmd_cycle() {
+  _parse_pool_flag "$@"
   vault_is_initialized || { log_error "Vault not initialized"; return 1; }
-  cycle_account
+  pools_migrate_if_needed
+  local pool="${POOL_ARG:-$POOLS_INTERACTIVE}"
+  cycle_pool "$pool"
 }
 
 cmd_mark_limited() {
@@ -320,8 +360,11 @@ cmd_update_utilization() {
 }
 
 cmd_has_available() {
+  _parse_pool_flag "$@"
   vault_is_initialized || return 1
-  has_available_account
+  pools_migrate_if_needed
+  local pool="${POOL_ARG:-$POOLS_INTERACTIVE}"
+  has_available_in_pool "$pool"
 }
 
 cmd_setup_longterm() {
@@ -344,16 +387,20 @@ cmd_setup_longterm() {
 }
 
 cmd_get_token() {
+  _parse_pool_flag "$@"
   vault_is_initialized || return 1
+  pools_migrate_if_needed
+  local pool="${POOL_ARG:-$POOLS_INTERACTIVE}"
+  pools_exists "$pool" || { log_error "Pool '$pool' does not exist"; return 1; }
+
   local name
-  name=$(state_active_account)
-  [[ -z "$name" ]] && { log_error "No active account"; return 1; }
+  name=$(pools_active "$pool")
+  [[ -z "$name" || "$name" == "null" ]] && { log_error "No active account in pool '$pool'"; return 1; }
 
   # Prefer long-term token, fall back to OAuth access token
   if vault_has_longterm "$name"; then
     vault_read_longterm "$name"
   else
-    # Fall back to OAuth access token from vault
     local cred
     cred=$(vault_read "$name") || return 1
     echo "$cred" | jq -r '.claudeAiOauth.accessToken // empty'
@@ -361,10 +408,14 @@ cmd_get_token() {
 }
 
 cmd_active_name() {
+  _parse_pool_flag "$@"
   vault_is_initialized || return 1
+  pools_migrate_if_needed
+  local pool="${POOL_ARG:-$POOLS_INTERACTIVE}"
+  pools_exists "$pool" || return 1
   local name
-  name=$(state_active_account)
-  [[ -n "$name" ]] && echo "$name" || return 1
+  name=$(pools_active "$pool")
+  [[ -n "$name" && "$name" != "null" ]] && echo "$name" || return 1
 }
 
 cmd_verify() {
@@ -418,9 +469,18 @@ cmd_restore() {
 
 cmd_status() {
   local json_output=false
-  [[ "${1:-}" == "--json" ]] && json_output=true
+  local args=()
+  for a in "$@"; do
+    case "$a" in
+      --json) json_output=true ;;
+      *)      args+=("$a") ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+  _parse_pool_flag "$@"
 
   vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  pools_migrate_if_needed
   state_clear_expired
 
   local active count
@@ -475,6 +535,32 @@ cmd_status() {
 
   # Show each account briefly
   cmd_list
+
+  # Show pools (after migration there's always at least "interactive")
+  echo ""
+  echo "${BOLD}POOLS${NC}"
+  echo ""
+  while IFS= read -r pool; do
+    [[ -n "$pool" ]] || continue
+    local pool_active wk_label
+    pool_active=$(pools_active "$pool")
+    if pools_writes_keychain "$pool"; then
+      wk_label="${DIM}(writes keychain)${NC}"
+    else
+      wk_label="${DIM}(long-term tokens only)${NC}"
+    fi
+    echo -e "  ${BOLD}${pool}${NC}   active: ${GREEN}${pool_active:-none}${NC}   $wk_label"
+    while IFS= read -r m; do
+      [[ -n "$m" ]] || continue
+      local marker="  "
+      [[ "$m" == "$pool_active" ]] && marker="→ "
+      local mstatus="available"
+      if state_is_limited "$m"; then
+        mstatus="limited ($(format_duration "$(state_limit_remaining "$m")"))"
+      fi
+      echo -e "    ${marker}${m}  ${DIM}${mstatus}${NC}"
+    done < <(pools_list_members "$pool")
+  done < <(pools_list_names)
 }
 
 cmd_refresh() {
@@ -642,6 +728,104 @@ cmd_schedule() {
   esac
 }
 
+# ── Pool management ───────────────────────────────────────────────────────────
+
+_pool_usage() {
+  cat <<EOF
+${BOLD}cc-auth pool${NC} — manage account pools
+
+${BOLD}Subcommands:${NC}
+  list                              List all pools with members and active
+  create <pool> [--no-keychain]     Create empty pool (default: writes_keychain=true)
+  delete <pool>                     Delete a pool
+  add <pool> <account>              Add an account to a pool
+  remove <pool> <account>           Remove an account from a pool
+
+${BOLD}Examples:${NC}
+  cc-auth pool create background --no-keychain
+  cc-auth pool add background technology
+  cc-auth pool add background product
+  cc-auth pool remove interactive technology
+  cc-auth pool list
+EOF
+}
+
+cmd_pool() {
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  pools_migrate_if_needed
+
+  local sub="${1:-list}"
+  shift || true
+
+  case "$sub" in
+    list)
+      while IFS= read -r pool; do
+        [[ -n "$pool" ]] || continue
+        local active wk
+        active=$(pools_active "$pool")
+        if pools_writes_keychain "$pool"; then
+          wk="writes_keychain=true"
+        else
+          wk="writes_keychain=false"
+        fi
+        echo -e "${BOLD}${pool}${NC}  ($wk)"
+        echo -e "  active: ${GREEN}${active:-none}${NC}"
+        local members=""
+        while IFS= read -r m; do
+          [[ -n "$m" ]] || continue
+          members+="$m "
+        done < <(pools_list_members "$pool")
+        echo -e "  members: ${members:-${DIM}<empty>${NC}}"
+        echo ""
+      done < <(pools_list_names)
+      ;;
+    create)
+      local name="" wk="true"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --no-keychain) wk="false"; shift ;;
+          --keychain)    wk="true";  shift ;;
+          -*)            log_error "Unknown option: $1"; return 1 ;;
+          *)             name="$1";  shift ;;
+        esac
+      done
+      [[ -z "$name" ]] && { log_error "Usage: cc-auth pool create <name> [--no-keychain]"; return 1; }
+      pools_create "$name" "$wk" || return 1
+      log_ok "Created pool '$name' (writes_keychain=$wk)"
+      emit_event "$CC_AUTH_DIR" "pool_created" "name=$name" "writes_keychain=$wk"
+      ;;
+    delete)
+      local name="${1:-}"
+      [[ -z "$name" ]] && { log_error "Usage: cc-auth pool delete <name>"; return 1; }
+      pools_delete "$name" || return 1
+      log_ok "Deleted pool '$name'"
+      emit_event "$CC_AUTH_DIR" "pool_deleted" "name=$name"
+      ;;
+    add)
+      local pool="${1:-}" acct="${2:-}"
+      [[ -z "$pool" || -z "$acct" ]] && { log_error "Usage: cc-auth pool add <pool> <account>"; return 1; }
+      pools_add_member "$pool" "$acct" || return 1
+      log_ok "Added '$acct' to pool '$pool'"
+      emit_event "$CC_AUTH_DIR" "pool_member_added" "pool=$pool" "name=$acct"
+      ;;
+    remove)
+      local pool="${1:-}" acct="${2:-}"
+      [[ -z "$pool" || -z "$acct" ]] && { log_error "Usage: cc-auth pool remove <pool> <account>"; return 1; }
+      pools_remove_member "$pool" "$acct" || return 1
+      log_ok "Removed '$acct' from pool '$pool'"
+      emit_event "$CC_AUTH_DIR" "pool_member_removed" "pool=$pool" "name=$acct"
+      ;;
+    help|--help|-h)
+      _pool_usage
+      ;;
+    *)
+      log_error "Unknown pool subcommand: $sub"
+      _pool_usage
+      return 1
+      ;;
+  esac
+}
+
 # ── Usage ─────────────────────────────────────────────────────────────────────
 
 usage() {
@@ -659,9 +843,16 @@ ${BOLD}Setup:${NC}
   refresh-all                   Check all tokens, refresh expiring ones
 
 ${BOLD}Switching:${NC}
-  activate <name>               Switch to a specific account
-  cycle                         Switch to next available account
+  activate <name> [--pool=<p>]  Switch to a specific account (default pool: interactive)
+  cycle [--pool=<p>]            Switch to next available account in pool
   restore                       Restore original pre-cc-auth credentials
+
+${BOLD}Pools:${NC}
+  pool list                              List pools, members, and active per-pool
+  pool create <p> [--no-keychain]        Create pool (interactive writes keychain; bg doesn't)
+  pool add <p> <account>                 Add account to pool
+  pool remove <p> <account>              Remove account from pool
+  pool delete <p>                        Delete a pool
 
 ${BOLD}Status:${NC}
   list [--json]                 List all accounts with status
@@ -671,11 +862,11 @@ ${BOLD}Status:${NC}
 
 ${BOLD}Long-term tokens:${NC}
   setup-longterm <name> <token>  Store a 1-year token from claude setup-token
-  get-token                      Print active account's long-term token (for env var)
+  get-token [--pool=<p>]         Print pool's active long-term token (default: interactive)
 
 ${BOLD}Rate limiting:${NC}
-  mark-limited <name> <secs>    Record subscription limit for account
-  has-available                  Exit 0 if any account is available
+  mark-limited <name> <secs>    Record subscription limit for account (global, all pools)
+  has-available [--pool=<p>]    Exit 0 if any account in pool is available
 
 ${BOLD}Scheduling:${NC}
   schedule install|remove|status  Manage token refresh schedule (launchd)
@@ -714,6 +905,7 @@ main() {
     update-utilization) cmd_update_utilization "$@" ;;
     setup-longterm) cmd_setup_longterm "$@" ;;
     get-token)      cmd_get_token "$@" ;;
+    pool)           cmd_pool "$@" ;;
     schedule)       cmd_schedule "$@" ;;
     help|--help|-h) usage ;;
     *)              log_error "Unknown command: $cmd"; usage; return 1 ;;
