@@ -186,7 +186,8 @@ run_with_timeout() {
     (
       "$@" &
       local cmd_pid=$!
-      ( sleep "$secs" && kill "$cmd_pid" 2>/dev/null ) &
+      # Trap TERM so killing the timer subshell also kills the sleep child
+      ( trap 'kill $(jobs -p) 2>/dev/null' TERM; sleep "$secs" & wait $! && kill "$cmd_pid" 2>/dev/null ) &
       local timer_pid=$!
       wait "$cmd_pid" 2>/dev/null
       local rc=$?
