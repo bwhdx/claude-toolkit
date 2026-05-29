@@ -328,7 +328,7 @@ func findCCAuth() string {
 	// Check relative to working dir
 	home, _ := os.UserHomeDir()
 	candidates := []string{
-		filepath.Join(home, "Code", "claude-toolkit", "cc-auth", "cc-auth"),
+		filepath.Join(home, "Code", "Personal", "claude-toolkit", "cc-auth", "cc-auth"),
 	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
