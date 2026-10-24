@@ -180,6 +180,18 @@ accounts_list_names() {
 }
 
 # Get count of accounts
+# Find the registered account name for an email (case-insensitive)
+# Args: $1 = email. Prints name and returns 0, or returns 1 if unregistered.
+accounts_name_for_email() {
+  local email="$1" name
+  [[ -n "$email" ]] || return 1
+  name=$(jq -r --arg e "$email" \
+    '.accounts[] | select((.email // "" | ascii_downcase) == ($e | ascii_downcase)) | .name' \
+    "$CC_AUTH_ACCOUNTS_FILE" 2>/dev/null | head -1)
+  [[ -n "$name" ]] || return 1
+  echo "$name"
+}
+
 accounts_count() {
   jq '.accounts | length' "$CC_AUTH_ACCOUNTS_FILE" 2>/dev/null
 }

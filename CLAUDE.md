@@ -49,6 +49,7 @@ make help           # Show all targets
 ### Key paths
 
 - `~/.cc-auth/` — cc-auth vault (encrypted credentials, state)
+- `~/.cc-auth/usage-cache.json` — short-TTL cache of rate limit probes
 - `~/.claude/sessions/` — Claude Code session files (read by cc-monitor)
 - `~/.claude-toolkit/` — Shared config directory (future use, from `pkg/config`)
 
@@ -98,6 +99,79 @@ These are the stable output shapes consumers can depend on. All tools support `-
   "limited": 1
 }
 ```
+
+### `cc-auth usage --json`
+
+Rate limit headroom per account, probed via each account's long-term token. Read-only:
+no keychain swap, no token rotation, no writes to cycling state.
+
+```json
+[
+  {
+    "account": "leadership",
+    "email": "leadership@kash.bot",
+    "subscription": "max",
+    "rate_limit_tier": "default_claude_max_20x",
+    "active": true,
+    "recorded_active": false,
+    "ok": true,
+    "session": {
+      "percent_used": 80,
+      "percent_left": 20,
+      "resets_at_epoch": 1788375000,
+      "resets_at": "2026-09-02T18:50:00Z",
+      "resets_in_seconds": 4035,
+      "status": "allowed|rejected",
+      "severity": "ok|warning|critical"
+    },
+    "weekly": { "...": "same shape as session" },
+    "status": "allowed|rejected",
+    "binding": "session|weekly",
+    "representative_claim": "five_hour|seven_day",
+    "fallback": "available",
+    "fallback_percentage": 50,
+    "overage_status": "rejected",
+    "overage_disabled_reason": "org_level_disabled",
+    "retry_after_seconds": 2319,
+    "organization_id": "53745887-676c-4947-a3b3-48663e813ce0",
+    "workspace_id": "wrkspc_01UqEaDazwA9MmTx9dmb6uVz",
+    "cached": true
+  }
+]
+```
+
+When usage cannot be read, `ok` is `false` and `error` carries the reason
+(`no_longterm_token`, `unauthorized`, `forbidden_scope`, `rate_limited`,
+`server_error`, `no_response`, `no_rate_limit_headers`, `vault_read_failed`)
+instead of `session`/`weekly`. One account failing never fails the others.
+
+Notes:
+- `active` is ground truth — the account the **keychain** is actually logged into,
+  resolved via `claude auth status`. `recorded_active` is what cc-auth's
+  `state.json` believes. They differ whenever someone runs `claude login`
+  outside cc-auth, since only cc-auth's own activations write that state.
+- `binding` names the window that is the live constraint, normalized from
+  `representative_claim`. Each window also carries `surpassed_threshold` when it
+  is the one that blew.
+- `retry_after_seconds` and `fallback_percentage` are numbers when present and
+  `null` otherwise; the string fields are `""` when the response omits them.
+- `fallback_percentage` is a fixed policy constant (0.5, reported here on a
+  0-100 scale) — identical across accounts and utilization levels, and its exact
+  meaning is undocumented. It is exposed in JSON but deliberately not shown in
+  the table, where it would read as a per-account measurement.
+- Window `status` is the API's own verdict — `allowed`, `allowed_warning`
+  (close to the limit), or `rejected` — and is independent of `severity`, which
+  is derived locally from `percent_left`.
+- `session` is the 5h window, `weekly` the 7d window — the two Anthropic reports
+  through `anthropic-ratelimit-unified-*` response headers.
+- An exhausted account answers HTTP 429 but still reports its utilization and
+  reset, so that is parsed as data (`status: "rejected"`), not as an error.
+- Per-model weekly breakdowns are NOT available here. They come from
+  `/api/oauth/usage`, which requires the `user:profile` scope that
+  `claude setup-token` long-term tokens do not carry.
+- Each probe is a real (minimal) billed request against that account's own quota,
+  so results are cached for `CC_USAGE_CACHE_TTL` seconds (default 60).
+  `--refresh` bypasses the cache; `CC_USAGE_CACHE_TTL=0` disables it.
 
 ### `cc-monitor --json`
 

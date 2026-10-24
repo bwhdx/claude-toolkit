@@ -26,6 +26,7 @@ source "$CC_AUTH_ROOT/lib/keychain.bash"
 source "$CC_AUTH_ROOT/lib/vault.bash"
 source "$CC_AUTH_ROOT/lib/pools.bash"
 source "$CC_AUTH_ROOT/lib/cycling.bash"
+source "$CC_AUTH_ROOT/lib/usage.bash"
 
 # ── --pool=<name> arg parser ──────────────────────────────────────────────────
 # Extracts --pool/--pool=<name> from positional args. Echoes the pool name on
@@ -828,6 +829,256 @@ cmd_pool() {
 
 # ── Usage ─────────────────────────────────────────────────────────────────────
 
+# Show rate limit headroom across accounts.
+# Each account is probed with a minimal request using its long-term token, which
+# returns Anthropic's unified rate limit headers. Read-only: no keychain swap, no
+# token rotation, and no writes to cycling state.
+
+# "default_claude_max_20x" -> "20x"
+_usage_short_tier() {
+  case "${1:-}" in
+    *_20x) echo "20x" ;;
+    *_5x)  echo "5x" ;;
+    *)     echo "" ;;
+  esac
+}
+
+# Local wall-clock time for a reset, so "resets in 1h7m" has a concrete anchor
+_usage_local_time() {
+  local epoch="${1:-0}"
+  [[ "$epoch" =~ ^[0-9]+$ ]] && (( epoch > 0 )) || { echo ""; return; }
+  date -r "$epoch" +"%b %-d %H:%M" 2>/dev/null || date -d "@$epoch" +"%b %-d %H:%M" 2>/dev/null || echo ""
+}
+
+_usage_render_window() {
+  local label="$1" win="$2" is_binding="${3:-false}"
+  if [[ -z "$win" || "$win" == "null" ]]; then
+    printf "    %-9s ${DIM}unavailable${NC}\n" "$label"
+    return
+  fi
+
+  local left resets epoch severity wstatus color
+  left=$(echo "$win" | jq -r '.percent_left')
+  resets=$(echo "$win" | jq -r '.resets_in_seconds')
+  epoch=$(echo "$win" | jq -r '.resets_at_epoch')
+  severity=$(echo "$win" | jq -r '.severity')
+  wstatus=$(echo "$win" | jq -r '.status')
+
+  case "$severity" in
+    critical) color="$RED" ;;
+    warning)  color="$YELLOW" ;;
+    *)        color="$GREEN" ;;
+  esac
+
+  # NB: do not shadow $label — it holds the window name (Session/Weekly)
+  local flag="" status_label
+  status_label=$(usage_status_label "$wstatus")
+  if [[ -n "$status_label" ]]; then
+    if [[ "$wstatus" == "rejected" ]]; then flag=" ${RED}${status_label}${NC}"
+    else                                    flag=" ${YELLOW}${status_label}${NC}"
+    fi
+  fi
+  # The representative claim tells us which window is the live constraint
+  [[ "$is_binding" == "true" ]] && flag="${flag} ${CYAN}◀ binding${NC}"
+
+  printf "    %-9s ${color}%s${NC} %b%3d%% left${NC}   ${DIM}resets in %-7s (%s)${NC}%b\n" \
+    "$label" "$(usage_bar "$left" 20)" "$color" "$left" \
+    "$(format_duration "$resets")" "$(_usage_local_time "$epoch")" "$flag"
+}
+
+_usage_error_text() {
+  case "$1" in
+    no_longterm_token)     echo "no long-term token — run: cc-auth setup-longterm <name> <token>" ;;
+    unauthorized)          echo "token rejected (401) — re-run: cc-auth setup-longterm <name> <token>" ;;
+    forbidden_scope)       echo "token lacks the required scope" ;;
+    rate_limited)          echo "API rate limited the probe — try again shortly" ;;
+    server_error)          echo "Anthropic API error" ;;
+    no_response)           echo "no response — check network connectivity" ;;
+    no_rate_limit_headers) echo "response carried no rate limit headers" ;;
+    vault_read_failed)     echo "could not decrypt vault entry" ;;
+    *)                     echo "$1" ;;
+  esac
+}
+
+# One-line digest of the response details that are not per-window
+_usage_render_detail() {
+  local row="$1"
+  local parts=() v r
+
+  # fallback_percentage is a fixed policy constant (identical on every account)
+  # whose meaning is undocumented, so it stays in --json rather than being shown
+  # next to real measurements. The status is per-account and does carry meaning.
+  v=$(echo "$row" | jq -r '.fallback // ""')
+  [[ -n "$v" ]] && parts+=("fallback $v")
+
+  v=$(echo "$row" | jq -r '.overage_status // ""')
+  if [[ -n "$v" ]]; then
+    r=$(echo "$row" | jq -r '.overage_disabled_reason // ""')
+    [[ -n "$r" ]] && parts+=("overage $v ($r)") || parts+=("overage $v")
+  fi
+
+  v=$(echo "$row" | jq -r '.retry_after_seconds // empty')
+  [[ -n "$v" ]] && parts+=("retry after $(format_duration "$v")")
+
+  v=$(echo "$row" | jq -r '.organization_id // ""')
+  [[ -n "$v" ]] && parts+=("org ${v:0:8}")
+
+  v=$(echo "$row" | jq -r '.workspace_id // ""')
+  [[ -n "$v" ]] && parts+=("ws ${v:0:14}")
+
+  [[ "$(echo "$row" | jq -r '.cached')" == "true" ]] && parts+=("cached")
+
+  if [[ ${#parts[@]} -gt 0 ]]; then
+    local joined
+    joined=$(printf " · %s" "${parts[@]}")
+    echo "    ${DIM}${joined:3}${NC}"
+  fi
+}
+
+cmd_usage() {
+  local json_output=false refresh=false
+  local args=()
+  for a in "$@"; do
+    case "$a" in
+      --json)    json_output=true ;;
+      --refresh) refresh=true ;;
+      *)         args+=("$a") ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+  _parse_pool_flag "$@"
+  set -- ${REMAINING[@]+"${REMAINING[@]}"}
+
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  require_cmd curl || return 1
+  require_cmd jq || return 1
+
+  # Decide which accounts to probe: one named, one pool, or everything
+  local names=() n
+  if [[ -n "${1:-}" ]]; then
+    names=("$1")
+  elif [[ -n "$POOL_ARG" ]]; then
+    pools_exists "$POOL_ARG" || { log_error "No such pool: $POOL_ARG"; return 1; }
+    while IFS= read -r n; do [[ -n "$n" ]] && names+=("$n"); done < <(pools_list_members "$POOL_ARG")
+  else
+    while IFS= read -r n; do [[ -n "$n" ]] && names+=("$n"); done < <(accounts_list_names)
+  fi
+
+  if [[ ${#names[@]} -eq 0 ]]; then
+    [[ "$json_output" == "true" ]] && { echo "[]"; return 0; }
+    log_error "No accounts to check"
+    return 1
+  fi
+
+  # Who is ACTUALLY logged in. state.json only records cc-auth's own activations,
+  # so an external `claude login` leaves it stale — ask the keychain instead.
+  local live_account recorded_account live_email
+  live_account=$(keychain_active_account 2>/dev/null || echo "")
+  live_email=$(keychain_current_email 2>/dev/null || echo "")
+  recorded_account=$(state_active_account)
+
+  # Probe every account concurrently — five accounts cost one round trip, not five
+  local tmpdir i=0
+  tmpdir=$(mktemp -d)
+  for n in "${names[@]}"; do
+    ( usage_probe_account "$n" "$refresh" > "$tmpdir/$i.json" 2>/dev/null ) &
+    i=$(( i + 1 ))
+  done
+  wait
+
+  local results="[]"
+  i=0
+  for n in "${names[@]}"; do
+    local u info
+    u=$(cat "$tmpdir/$i.json" 2>/dev/null)
+    echo "$u" | jq -e . >/dev/null 2>&1 || u='{"ok":false,"error":"probe_failed","cached":false}'
+    info=$(accounts_get "$n" 2>/dev/null); [[ -n "$info" ]] || info='{}'
+    results=$(echo "$results" | jq -c \
+      --arg n "$n" \
+      --argjson info "$info" \
+      --argjson active "$([[ "$n" == "$live_account" ]] && echo true || echo false)" \
+      --argjson recorded "$([[ "$n" == "$recorded_account" ]] && echo true || echo false)" \
+      --argjson u "$u" \
+      '. + [{account:$n,
+             email: ($info.email // ""),
+             subscription: ($info.subscriptionType // ""),
+             rate_limit_tier: ($info.rateLimitTier // ""),
+             active: $active,
+             recorded_active: $recorded} + $u]')
+    i=$(( i + 1 ))
+  done
+  rm -rf "$tmpdir"
+
+  if [[ "$json_output" == "true" ]]; then
+    echo "$results" | jq .
+    return 0
+  fi
+
+  # ── Table output ────────────────────────────────────────────────────────────
+  echo "${BOLD}USAGE${NC} (${#names[@]})"
+  if [[ -n "$live_email" ]]; then
+    echo "  ${DIM}Logged in:${NC} ${BOLD}${live_account:-unregistered}${NC} ${DIM}($live_email)${NC}"
+  else
+    echo "  ${DIM}Logged in: unknown — 'claude auth status' returned nothing${NC}"
+  fi
+  if [[ -n "$live_account" && -n "$recorded_account" && "$live_account" != "$recorded_account" ]]; then
+    echo "  ${YELLOW}⚠${NC} cc-auth still records ${BOLD}${recorded_account}${NC} as active — its state is stale."
+    echo "    ${DIM}Caused by logging in outside cc-auth. Realign with: cc-auth activate ${live_account}${NC}"
+  fi
+  echo ""
+
+  local idx
+  for idx in $(seq 0 $(( ${#names[@]} - 1 ))); do
+    local row name email ok tier sub
+    row=$(echo "$results" | jq -c ".[$idx]")
+    name=$(echo "$row" | jq -r '.account')
+    email=$(echo "$row" | jq -r '.email // ""')
+    sub=$(echo "$row" | jq -r '.subscription // ""')
+    tier=$(_usage_short_tier "$(echo "$row" | jq -r '.rate_limit_tier // ""')")
+    ok=$(echo "$row" | jq -r '.ok')
+
+    local plan="$sub"
+    [[ -n "$tier" ]] && plan="${sub}·${tier}"
+
+    local marker=""
+    [[ "$(echo "$row" | jq -r '.active')" == "true" ]] && marker=" ${GREEN}← logged in${NC}"
+
+    printf "  ${BOLD}%-12s${NC} ${DIM}%-24s %-8s${NC}%b\n" "$name" "$email" "$plan" "$marker"
+
+    if [[ "$ok" == "true" ]]; then
+      local binding
+      binding=$(echo "$row" | jq -r '.binding // ""')
+      _usage_render_window "Session" "$(echo "$row" | jq -c '.session')" \
+        "$([[ "$binding" == "session" ]] && echo true || echo false)"
+      _usage_render_window "Weekly"  "$(echo "$row" | jq -c '.weekly')" \
+        "$([[ "$binding" == "weekly" ]] && echo true || echo false)"
+      _usage_render_detail "$row"
+    else
+      echo "    ${RED}✗${NC} ${DIM}$(_usage_error_text "$(echo "$row" | jq -r '.error')")${NC}"
+    fi
+    echo ""
+  done
+
+  # ── Summary ─────────────────────────────────────────────────────────────────
+  local usable blocked failed best
+  usable=$(echo "$results"  | jq '[.[] | select(.ok==true and (.session.percent_left // 0) > 0)] | length')
+  blocked=$(echo "$results" | jq '[.[] | select(.ok==true and (.session.percent_left // 0) == 0)] | length')
+  failed=$(echo "$results"  | jq '[.[] | select(.ok!=true)] | length')
+  best=$(usage_best_account "$results")
+
+  echo "  ${BOLD}Summary${NC}  ${GREEN}${usable} with session headroom${NC}  ${RED}${blocked} exhausted${NC}  ${DIM}${failed} unreadable${NC}"
+  if [[ -n "$best" ]]; then
+    local bs bw
+    bs=$(echo "$results" | jq -r --arg b "$best" '.[] | select(.account==$b) | .session.percent_left')
+    bw=$(echo "$results" | jq -r --arg b "$best" '.[] | select(.account==$b) | .weekly.percent_left')
+    echo "  ${DIM}Most headroom:${NC} ${BOLD}${best}${NC} ${DIM}(${bs}% session, ${bw}% weekly)${NC}"
+  else
+    local soonest
+    soonest=$(echo "$results" | jq -r '[.[] | select(.ok==true) | .session.resets_in_seconds] | min // empty')
+    [[ -n "$soonest" ]] && echo "  ${YELLOW}No account has session headroom${NC} ${DIM}— soonest reset in $(format_duration "$soonest")${NC}"
+  fi
+}
+
 usage() {
   cat <<EOF
 ${BOLD}cc-auth${NC} — Multi-account token manager for Claude Code
@@ -858,6 +1109,8 @@ ${BOLD}Status:${NC}
   list [--json]                 List all accounts with status
   status [--json]               Show active account and availability
   verify [<name>|--all]         Check token validity
+  usage [--json] [--refresh]    Session/weekly headroom for all accounts,
+        [--pool=<p>] [<name>]     or just one account/pool
   active-name                   Print active account name
 
 ${BOLD}Long-term tokens:${NC}
@@ -900,6 +1153,7 @@ main() {
     verify)         cmd_verify "$@" ;;
     restore)        cmd_restore "$@" ;;
     status)         cmd_status "$@" ;;
+    usage)          cmd_usage "$@" ;;
     refresh)        cmd_refresh "$@" ;;
     refresh-all)    cmd_refresh_all "$@" ;;
     update-utilization) cmd_update_utilization "$@" ;;

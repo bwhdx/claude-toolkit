@@ -70,6 +70,17 @@ keychain_current_email() {
   claude auth status 2>/dev/null | jq -r '.email // empty'
 }
 
+# Resolve which registered account the keychain is actually logged into.
+# state.json only records the last activation cc-auth performed, so an external
+# `claude login` leaves it stale; this asks Claude Code itself.
+# Prints the account name and returns 0, or returns 1 if unknown/unregistered.
+keychain_active_account() {
+  local email
+  email=$(keychain_current_email) || return 1
+  [[ -n "$email" ]] || return 1
+  accounts_name_for_email "$email"
+}
+
 # Get full auth status as JSON
 keychain_auth_status() {
   claude auth status 2>/dev/null
