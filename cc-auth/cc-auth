@@ -26,6 +26,7 @@ source "$CC_AUTH_ROOT/lib/keychain.bash"
 source "$CC_AUTH_ROOT/lib/vault.bash"
 source "$CC_AUTH_ROOT/lib/pools.bash"
 source "$CC_AUTH_ROOT/lib/cycling.bash"
+source "$CC_AUTH_ROOT/lib/usage.bash"
 
 # ── --pool=<name> arg parser ──────────────────────────────────────────────────
 # Extracts --pool/--pool=<name> from positional args. Echoes the pool name on
@@ -149,9 +150,10 @@ cmd_add() {
     return 1
   }
 
-  # Register account
+  # Register account, with its organization: `setup-longterm` checks tokens against it
   accounts_add "$name" "$acct_email" "$sub_type" "$rate_tier"
   state_init_account "$name"
+  _record_org "$name" "$(jq -r '.claudeAiOauth.accessToken // empty' <<< "$new_cred")"
 
   # If this is the first account, set it as active
   if [[ -z "$(state_active_account)" ]]; then
@@ -367,23 +369,235 @@ cmd_has_available() {
   has_available_in_pool "$pool"
 }
 
+# Store the organization a token belongs to, as the account's identity check.
+# Args: $1 = account name, $2 = token of a full sign-in for that account
+_record_org() {
+  local name="$1" token="$2" org
+  [[ -n "$token" ]] || return 0
+  org=$(usage_probe "$token" | jq -r '.organization_id // empty')
+  if [[ -n "$org" ]]; then
+    accounts_set_org "$name" "$org"
+  else
+    log_warn "$name: could not read its organization; long-term tokens for it cannot be checked"
+  fi
+}
+
+# Organization recorded for an account. Accounts added before this was recorded get it from
+# their stored sign-in while that is still valid.
+_account_org() {
+  local name="$1" org line
+  org=$(accounts_get "$name" | jq -r '.organization_id // empty')
+  if [[ -z "$org" ]] && line=$(usage_token "$name") && [[ "${line%%$'\t'*}" == oauth ]]; then
+    _record_org "$name" "${line#*$'\t'}"
+    org=$(accounts_get "$name" | jq -r '.organization_id // empty')
+  fi
+  echo "$org"
+}
+
+# Store a 1-year token from `claude setup-token`, after checking it works and belongs to the
+# account. Never takes the token as an argument (shell history, process list): it is pasted at a
+# hidden prompt or piped in.
 cmd_setup_longterm() {
-  local name="${1:-}" token="${2:-}"
-  [[ -z "$name" ]] && { log_error "Usage: cc-auth setup-longterm <name> <token>"; return 1; }
+  local name="${1:-}"
+  [[ -z "$name" ]] && { log_error "Usage: cc-auth setup-longterm <name>   (paste the token when asked, or pipe it in)"; return 2; }
+  if [[ $# -gt 1 ]]; then
+    log_error "Do not pass the token as an argument: it would be saved in shell history and visible in the process list."
+    log_error "Run 'cc-auth setup-longterm $name' and paste it when asked, or pipe it in."
+    return 2
+  fi
   vault_is_initialized || { log_error "Vault not initialized"; return 1; }
   accounts_name_exists "$name" || { log_error "Unknown account: $name"; return 1; }
 
-  if [[ -z "$token" ]]; then
-    # Read from stdin if not passed as arg (for piping)
-    echo "Paste the token from 'claude setup-token' (then press Enter):"
-    read -r token
+  local token="" email
+  email=$(accounts_get "$name" | jq -r '.email // "?"')
+  if [[ -t 0 ]]; then
+    read -rsp "Paste the token from 'claude setup-token' for '$name' ($email), then press Enter (hidden): " token || true
+    echo >&2
+  else
+    IFS= read -r token || true
   fi
-
+  token="${token//[[:space:]]/}"
   [[ -z "$token" ]] && { log_error "No token provided"; return 1; }
 
+  local res org expected
+  res=$(usage_probe "$token")
+  if [[ "$(jq -r '.ok' <<< "$res")" != true ]]; then
+    log_error "That token did not work (HTTP $(jq -r '.http' <<< "$res")). Run 'claude setup-token' again and paste the new token."
+    return 10
+  fi
+  org=$(jq -r '.organization_id // empty' <<< "$res")
+  # Accounts in one Team organization share its id, so this tells them apart only across organizations.
+  expected=$(_account_org "$name")
+  if [[ -z "$expected" ]]; then
+    log_warn "'$name' has no recorded organization, so this token's account could not be checked"
+  elif [[ "$org" != "$expected" ]]; then
+    log_error "That token belongs to a different account than '$name' ($email). Nothing was stored."
+    log_error "In the browser, sign in to claude.ai as $email, run 'claude setup-token' again and paste the new token."
+    return 10
+  fi
+
   vault_write_longterm "$name" "$token"
-  log_ok "Stored long-term token for '$name'"
+  log_ok "Stored long-term token for '$name' ($email)"
   emit_event "$CC_AUTH_DIR" "longterm_token_stored" "name=$name"
+}
+
+# Live 5-hour and weekly usage for every account (or the named ones), probed in parallel.
+# Also records the figures in state, so cycling and `status` use them.
+# Exit: 0 when every account was read, 1 otherwise.
+cmd_usage() {
+  local json_output=false names=() a
+  for a in "$@"; do
+    case "$a" in
+      --json) json_output=true ;;
+      -*)     log_error "Unknown option: $a"; return 2 ;;
+      *)      names+=("$a") ;;
+    esac
+  done
+  vault_is_initialized || { log_error "Vault not initialized (run 'cc-auth init')"; return 1; }
+  if [[ ${#names[@]} -eq 0 ]]; then
+    while IFS= read -r a; do [[ -n "$a" ]] && names+=("$a"); done < <(accounts_list_names)
+  fi
+  [[ ${#names[@]} -gt 0 ]] || { log_error "No accounts yet (cc-auth onboard <file>, or cc-auth add)"; return 1; }
+  for a in "${names[@]}"; do
+    accounts_name_exists "$a" || { log_error "Unknown account: $a"; return 1; }
+  done
+
+  local tmp i
+  tmp=$(mktemp -d) || return 1
+  for i in "${!names[@]}"; do
+    usage_account "${names[$i]}" > "$tmp/$i.json" &
+  done
+  wait
+
+  local results="[]" res
+  for i in "${!names[@]}"; do
+    res=$(cat "$tmp/$i.json")
+    usage_record "$res"
+    results=$(jq -c --argjson r "$res" '. + [$r]' <<< "$results")
+  done
+  rm -rf "$tmp"
+
+  if [[ "$json_output" == true ]]; then
+    jq . <<< "$results"
+  else
+    _usage_table "$results"
+  fi
+  [[ "$(jq '[.[] | select(.ok | not)] | length' <<< "$results")" -eq 0 ]]
+}
+
+_usage_table() {
+  local results="$1" now
+  now=$(now_epoch)
+  echo "${BOLD}USAGE${NC} ($(jq length <<< "$results") accounts)"
+  echo ""
+  printf "  ${BOLD}%-12s %-30s %-18s %-18s %s${NC}\n" ACCOUNT EMAIL "5-HOUR" WEEKLY STATE
+  local name email ok http src s5 r5 s7 r7 status mismatch
+  while IFS=$'\t' read -r name email ok http src s5 r5 s7 r7 status mismatch; do
+    local c5="" c7="" state color="$GREEN"
+    if [[ "$ok" == true ]]; then
+      c5=$(_usage_cell "$s5" "$( [[ "$r5" -gt 0 ]] && format_duration $(( r5 > now ? r5 - now : 0 )) )")
+      c7=$(_usage_cell "$s7" "$( [[ "$r7" -gt 0 ]] && usage_local_time "$r7" )")
+      state="ok"
+      [[ "$src" == oauth ]] && state="ok (no long-term token)"
+      if [[ "$status" == rejected ]]; then state="LIMITED"; color="$RED"; fi
+      if [[ "$mismatch" == true ]]; then state="WRONG ACCOUNT: re-run setup-longterm"; color="$RED"; fi
+    else
+      color="$RED"
+      case "$src:$http" in
+        none:*)   state="no token: run cc-auth setup-longterm $name" ;;
+        *:401)    state="token rejected: run cc-auth setup-longterm $name" ;;
+        *:0)      state="no response (network?)" ;;
+        *)        state="error (HTTP $http)" ;;
+      esac
+    fi
+    printf "  %-12s %-30s %-18s %-18s ${color}%s${NC}\n" "$name" "$email" "${c5:--}" "${c7:--}" "$state"
+  done < <(jq -r '.[] | [.name, (.email // "?"), .ok, (.http // "-"), .source,
+      (.five_hour.utilization // -1), (.five_hour.resets_at // 0),
+      (.seven_day.utilization // -1), (.seven_day.resets_at // 0),
+      (.status // "-"), .organization_mismatch] | map(tostring) | join("\t")' <<< "$results")
+  echo ""
+  echo "${DIM}  5-HOUR resets in the time shown; WEEKLY resets at the local time shown.${NC}"
+}
+
+# "24%  3h10m" from a 0.0-1.0 utilization and a reset label; empty when unknown.
+_usage_cell() {
+  local util="$1" label="$2"
+  [[ "$util" == -1 ]] && return 0
+  printf '%3s%%  %s' "$(jq -n --argjson u "$util" '$u * 100 | round')" "$label"
+}
+
+# Put back Claude Code's sign-in from before onboarding, when onboarding made an account active.
+# Only then: otherwise the keychain holds the user's own sign-in, which Claude Code may have
+# refreshed meanwhile (rotating its refresh token), so writing the older copy back would break it.
+# Args: $1 = keychain credentials before, $2 = active account before
+_onboard_restore() {
+  local before_cred="$1" before_active="$2"
+  [[ -z "$before_active" && -n "$(state_active_account)" && -n "$before_cred" ]] || return 0
+  keychain_write "$before_cred" || { log_warn "Could not put back Claude Code's previous sign-in (cc-auth restore)"; return 0; }
+  json_edit "$CC_AUTH_STATE_FILE" '.active_account = null'
+  log_dim "Claude Code's sign-in on this Mac is as it was before onboarding (cc-auth activate <name> to switch)"
+}
+
+# Add several accounts with their long-term tokens in one run, then show their usage.
+# Re-runnable: accounts and tokens already stored are skipped.
+# File: one account per line, "<name> <email>"; blank lines and # comments are ignored.
+cmd_onboard() {
+  local file="${1:-}"
+  [[ -n "$file" && -f "$file" ]] || { log_error "Usage: cc-auth onboard <file>   (one '<name> <email>' per line)"; return 2; }
+  vault_is_initialized || cmd_init || return 1
+
+  # Check the whole file first, so a typo does not stop the run halfway.
+  local name email rest n=0
+  while read -r name email rest <&3; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    [[ -n "$email" && -z "$rest" ]] || { log_error "$file: expected '<name> <email>', got: $name $email $rest"; return 2; }
+    n=$((n + 1))
+  done 3< "$file"
+  [[ "$n" -gt 0 ]] || { log_error "$file lists no accounts"; return 2; }
+
+  # Adding the first account makes it active and leaves it signed in to Claude Code on this Mac;
+  # onboarding puts back the sign-in Claude Code had before, so it never changes who you are.
+  local before_cred before_active
+  before_cred=$(keychain_read 2>/dev/null || true)
+  before_active=$(state_active_account)
+
+  echo "${BOLD}Onboarding $n accounts.${NC} Each needs two browser sign-ins: one to add the account,"
+  echo "one for its 1-year token. Claude Code's sign-in on this Mac is switched while an account is"
+  echo "added and put back afterwards, so avoid starting Claude Code sessions until this finishes."
+
+  while read -r name email rest <&3; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    echo ""
+    echo "${BOLD}── $name ($email)${NC}"
+    if accounts_name_exists "$name"; then
+      log_dim "$name: already added"
+    else
+      cmd_add "$name" --email "$email" || {
+        _onboard_restore "$before_cred" "$before_active"
+        log_error "Stopped at '$name'. Re-run 'cc-auth onboard $file' to continue."
+        return 1
+      }
+    fi
+    if vault_has_longterm "$name"; then
+      log_dim "$name: long-term token already stored"
+      continue
+    fi
+    echo "Next: a 1-year token for $email. If the browser is signed in to claude.ai as anyone else,"
+    echo "sign out there first. Copy the token 'claude setup-token' prints, then paste it below."
+    until claude setup-token && cmd_setup_longterm "$name"; do
+      local again=""
+      read -rp "Try '$name' again? [y/N] " again || true
+      [[ "$again" == [yY]* ]] || {
+        _onboard_restore "$before_cred" "$before_active"
+        log_error "Stopped at '$name'. Re-run 'cc-auth onboard $file' to continue."
+        return 1
+      }
+    done
+  done 3< "$file"
+  _onboard_restore "$before_cred" "$before_active"
+
+  echo ""
+  cmd_usage
 }
 
 cmd_get_token() {
@@ -859,10 +1073,12 @@ ${BOLD}Status:${NC}
   status [--json]               Show active account and availability
   verify [<name>|--all]         Check token validity
   active-name                   Print active account name
+  usage [<name>...] [--json]    Live 5-hour and weekly usage per account (one-token probe each)
 
 ${BOLD}Long-term tokens:${NC}
-  setup-longterm <name> <token>  Store a 1-year token from claude setup-token
-  get-token [--pool=<p>]         Print pool's active long-term token (default: interactive)
+  setup-longterm <name>         Store a 1-year token from claude setup-token (pasted, hidden)
+  onboard <file>                Add accounts from a '<name> <email>' list, with their tokens
+  get-token [--pool=<p>]        Print pool's active long-term token (default: interactive)
 
 ${BOLD}Rate limiting:${NC}
   mark-limited <name> <secs>    Record subscription limit for account (global, all pools)
@@ -878,6 +1094,8 @@ ${BOLD}Examples:${NC}
   cc-auth cycle
   cc-auth mark-limited ops1 14400
   cc-auth status
+  cc-auth onboard ~/accounts.txt
+  cc-auth usage
 EOF
 }
 
@@ -904,6 +1122,8 @@ main() {
     refresh-all)    cmd_refresh_all "$@" ;;
     update-utilization) cmd_update_utilization "$@" ;;
     setup-longterm) cmd_setup_longterm "$@" ;;
+    onboard)        cmd_onboard "$@" ;;
+    usage)          cmd_usage "$@" ;;
     get-token)      cmd_get_token "$@" ;;
     pool)           cmd_pool "$@" ;;
     schedule)       cmd_schedule "$@" ;;

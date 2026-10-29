@@ -99,6 +99,31 @@ These are the stable output shapes consumers can depend on. All tools support `-
 }
 ```
 
+### `cc-auth usage --json`
+
+```json
+[
+  {
+    "name": "leadership",
+    "email": "leadership@kash.bot",
+    "source": "longterm|oauth|none",
+    "http": 200,
+    "ok": true,
+    "organization_id": "uuid",
+    "status": "allowed|allowed_warning|rejected",
+    "representative": "five_hour|seven_day",
+    "five_hour": {"utilization": 0.24, "resets_at": 1793246400, "status": "allowed"},
+    "seven_day": {"utilization": 0.31, "resets_at": 1793718000, "status": "allowed"},
+    "expected_organization_id": "uuid",
+    "organization_mismatch": false
+  }
+]
+```
+
+`utilization` is 0.0 to 1.0; `resets_at` is epoch seconds. `ok` is false (and the usage fields
+null) when no usable token is stored (`source: "none"`) or the API rejected the token (`http`, 0
+when there was no response).
+
 ### `cc-monitor --json`
 
 ```json

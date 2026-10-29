@@ -83,6 +83,33 @@ cc-auth refresh-all                        # refresh tokens expiring soon
 cc-auth restore                            # restore pre-cc-auth credentials
 ```
 
+### Several accounts and their usage
+
+`onboard` adds every account in a list, each with its 1-year token, and can be re-run: accounts
+and tokens already stored are skipped. Each account needs two browser sign-ins (one to add it, one
+for `claude setup-token`); a token is only stored once it is shown to belong to that account's
+organization.
+
+```bash
+cat > ~/accounts.txt <<'LIST'
+# <name> <email>
+ops1 operations@kash.bot
+ops2 ops2@kash.bot
+LIST
+cc-auth onboard ~/accounts.txt
+cc-auth setup-longterm ops1     # replace one token (pasted at a hidden prompt, or piped in)
+```
+
+`usage` shows each account's live 5-hour and weekly usage and when each resets. It makes a
+one-token request per account (in parallel) and reads the rate-limit headers of the response, so it
+works with long-term tokens and costs a negligible share of each account's usage. The figures are
+also recorded for cycling and `status`.
+
+```bash
+cc-auth usage                   # table; exit 1 if any account could not be read
+cc-auth usage ops1 --json
+```
+
 ### Pools
 
 Pools let you keep separate active accounts for different workloads — e.g. `interactive` for your terminal, `background` for queued workers — so an agent rotating accounts doesn't yank the credentials out from under you.

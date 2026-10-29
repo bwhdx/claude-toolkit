@@ -3,6 +3,8 @@
 
 CC_KEYCHAIN_SERVICE="Claude Code-credentials"
 CC_KEYCHAIN_ACCOUNT="$(whoami)"
+# Keychain file to use; empty means the default (login) keychain. Tests point this at a scratch one.
+CC_KEYCHAIN_FILE="${CC_KEYCHAIN_FILE:-}"
 
 # Read current Claude Code credentials from macOS Keychain
 # Returns: JSON string (the credential blob) on stdout, or empty + exit 1
@@ -15,7 +17,7 @@ keychain_read() {
   cred=$(security find-generic-password \
     -s "$CC_KEYCHAIN_SERVICE" \
     -a "$CC_KEYCHAIN_ACCOUNT" \
-    -w 2>/dev/null) || return 1
+    -w ${CC_KEYCHAIN_FILE:+"$CC_KEYCHAIN_FILE"} 2>/dev/null) || return 1
   [[ -n "$cred" ]] && echo "$cred" || return 1
 }
 
@@ -35,13 +37,18 @@ keychain_write() {
   # Delete existing entry (ignore if not found, suppress output)
   security delete-generic-password \
     -s "$CC_KEYCHAIN_SERVICE" \
-    -a "$CC_KEYCHAIN_ACCOUNT" >/dev/null 2>&1 || true
+    -a "$CC_KEYCHAIN_ACCOUNT" ${CC_KEYCHAIN_FILE:+"$CC_KEYCHAIN_FILE"} >/dev/null 2>&1 || true
 
-  # Add new entry
-  security add-generic-password \
-    -s "$CC_KEYCHAIN_SERVICE" \
-    -a "$CC_KEYCHAIN_ACCOUNT" \
-    -w "$cred_json" 2>/dev/null
+  # Add new entry. The credentials go to `security -i` on stdin, never in its argument list
+  # (visible to every process); inside its quoted words, backslash and quote are escaped.
+  local v="${cred_json//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  local out
+  out=$(printf 'add-generic-password -s "%s" -a "%s" -w "%s" %s\n' \
+    "$CC_KEYCHAIN_SERVICE" "$CC_KEYCHAIN_ACCOUNT" "$v" "${CC_KEYCHAIN_FILE:+\"$CC_KEYCHAIN_FILE\"}" \
+    | security -i 2>&1) || return 1
+  # `security -i` exits 0 even when a command fails; a failure prints an error.
+  [[ -z "$out" ]]
 }
 
 # Verify that Claude Code recognizes the current keychain credentials

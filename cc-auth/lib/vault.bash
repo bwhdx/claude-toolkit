@@ -157,6 +157,16 @@ accounts_add() {
     }]'
 }
 
+# Record the organization an account belongs to (from a probe of its sign-in)
+# Args: $1 = name, $2 = organization id
+accounts_set_org() {
+  local name="$1" org="$2"
+  json_edit "$CC_AUTH_ACCOUNTS_FILE" \
+    --arg name "$name" \
+    --arg org "$org" \
+    '(.accounts[] | select(.name == $name)).organization_id = $org'
+}
+
 # Remove an account from the registry
 # Args: $1 = name
 accounts_remove() {

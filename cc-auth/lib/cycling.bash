@@ -149,7 +149,7 @@ _do_activate_in_pool() {
     # Background-style: long-term tokens are read directly via vault_read_longterm
     # at get-token time; we just record the pointer. No keychain mutation.
     if ! vault_has_longterm "$name"; then
-      log_warn "Account '$name' has no long-term token stored (use 'cc-auth setup-longterm $name <token>')"
+      log_warn "Account '$name' has no long-term token stored (use 'cc-auth setup-longterm $name')"
       # Don't fail — fallback path uses OAuth access token from vault.
     fi
     pools_set_active "$pool" "$name"
