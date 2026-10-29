@@ -111,6 +111,18 @@ cc-auth usage                   # table; exit 1 if any account could not be read
 cc-auth usage ops1 --json
 ```
 
+### Working as an account
+
+```bash
+cc-auth run technology            # Claude Code as technology@, in this terminal only
+cc-auth run product -c            # extra arguments go to claude
+```
+
+`run` starts Claude Code with the account's long-term token in its environment: no browser
+sign-in, nothing written to the keychain, and different terminals can run as different accounts
+at once. Token sessions have no claude.ai connectors (Gmail, Drive, ...) and no Claude in Chrome;
+use `/login` for an account when you need those.
+
 ### Pools
 
 Pools let you keep separate active accounts for different workloads — e.g. `interactive` for your terminal, `background` for queued workers — so an agent rotating accounts doesn't yank the credentials out from under you.

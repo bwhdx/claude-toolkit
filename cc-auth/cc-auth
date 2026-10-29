@@ -441,6 +441,30 @@ cmd_setup_longterm() {
   emit_event "$CC_AUTH_DIR" "longterm_token_stored" "name=$name"
 }
 
+# Start Claude Code as an account with its long-term token: no browser sign-in and no change to
+# the keychain, so each terminal can run as a different account at the same time. The token reaches
+# Claude Code in its environment, never its arguments. Token sessions have the user:inference scope
+# only: no claude.ai connectors and no Claude in Chrome (use a normal sign-in for those).
+# Args: <name> [claude arguments...]
+cmd_run() {
+  local name="${1:-}"
+  [[ -z "$name" || "$name" == -* ]] && { log_error "Usage: cc-auth run <name> [claude arguments...]"; return 2; }
+  shift
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  accounts_name_exists "$name" || { log_error "Unknown account: $name"; return 1; }
+  vault_has_longterm "$name" || { log_error "'$name' has no long-term token (cc-auth setup-longterm $name)"; return 1; }
+  require_cmd claude "Claude Code CLI required" || return 1
+
+  local token
+  token=$(vault_read_longterm "$name") || return 1
+  [[ -n "$token" ]] || { log_error "Long-term token for '$name' is empty"; return 1; }
+  log_dim "Claude Code as $name ($(accounts_get "$name" | jq -r '.email // "?"'))"
+  # An API key in the environment would take precedence over the token.
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+  export CLAUDE_CODE_OAUTH_TOKEN="$token"
+  exec claude "$@"
+}
+
 # Live 5-hour and weekly usage for every account (or the named ones), probed in parallel.
 # Also records the figures in state, so cycling and `status` use them.
 # Exit: 0 when every account was read, 1 otherwise.
@@ -1076,6 +1100,7 @@ ${BOLD}Setup:${NC}
   refresh-all                   Check all tokens, refresh expiring ones
 
 ${BOLD}Switching:${NC}
+  run <name> [claude args...]   Start Claude Code as an account (long-term token, no browser)
   activate <name> [--pool=<p>]  Switch to a specific account (default pool: interactive)
   cycle [--pool=<p>]            Switch to next available account in pool
   restore                       Restore original pre-cc-auth credentials
@@ -1115,6 +1140,7 @@ ${BOLD}Examples:${NC}
   cc-auth status
   cc-auth onboard ~/accounts.txt
   cc-auth usage
+  cc-auth run technology
 EOF
 }
 
@@ -1143,6 +1169,7 @@ main() {
     setup-longterm) cmd_setup_longterm "$@" ;;
     onboard)        cmd_onboard "$@" ;;
     usage)          cmd_usage "$@" ;;
+    run)            cmd_run "$@" ;;
     get-token)      cmd_get_token "$@" ;;
     pool)           cmd_pool "$@" ;;
     schedule)       cmd_schedule "$@" ;;

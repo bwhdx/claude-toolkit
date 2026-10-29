@@ -290,3 +290,22 @@ teardown_keychain() {
   ! vault_has_longterm a
   [[ "$output" == *"different account"* ]]
 }
+
+@test "run starts claude with the account's token in its environment, not its arguments" {
+  add_account a org1 good-org1
+  printf '#!/usr/bin/env bash\necho "args=$*"\necho "token=$CLAUDE_CODE_OAUTH_TOKEN"\necho "apikey=${ANTHROPIC_API_KEY:-unset}"\n' > "$FAKE_DIR/bin/claude"
+  chmod +x "$FAKE_DIR/bin/claude"
+  ANTHROPIC_API_KEY=sk-test run "$CC_AUTH" run a --model haiku
+  [ "$status" -eq 0 ]
+  [ "$(grep '^args=' <<< "$output")" = "args=--model haiku" ]
+  [[ "$output" == *"token=good-org1"* ]]
+  [[ "$output" == *"apikey=unset"* ]]
+}
+
+@test "run refuses an account without a long-term token" {
+  add_account a org1
+  run "$CC_AUTH" run a
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no long-term token"* ]]
+  [ ! -e "$FAKE_DIR/claude-calls" ]
+}
