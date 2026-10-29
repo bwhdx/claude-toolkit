@@ -8,16 +8,19 @@
 
 CC_AUTH_CMUX_TITLE="Claude accounts"
 
-# Compact JSON for the sidebar, soonest weekly reset first:
+# Compact JSON for the sidebar: every registered account, soonest weekly reset first, accounts
+# never checked last (with null figures, so they are listed rather than missing):
 # {v, in (account sessions use), at (epoch), accounts: [{n, w, wr, h, hr, s, t}]}
 #   w/h = weekly / 5-hour utilization (0-1), wr/hr = their resets (epoch), s = status, t = checked
 cmux_usage_payload() {
-  jq -c --argjson now "$(now_epoch)" '
-    {v: 1, in: (.session.account // null), at: $now,
-     accounts: [.accounts | to_entries[] | select(.value.windows) | .key as $n | .value.windows
-       | {n: $n, w: .seven_day.utilization, wr: .seven_day.resets_at,
-          h: .five_hour.utilization, hr: .five_hour.resets_at, s: .status, t: .checked}]
-       | sort_by(.wr // 1e18)}' "$CC_AUTH_STATE_FILE"
+  jq -cn --argjson now "$(now_epoch)" \
+    --slurpfile reg "$CC_AUTH_ACCOUNTS_FILE" --slurpfile st "$CC_AUTH_STATE_FILE" '
+    $st[0] as $s
+    | {v: 1, in: ($s.session.account // null), at: $now,
+       accounts: [$reg[0].accounts[].name as $n | ($s.accounts[$n].windows // {}) as $x
+         | {n: $n, w: $x.seven_day.utilization, wr: $x.seven_day.resets_at,
+            h: $x.five_hour.utilization, hr: $x.five_hour.resets_at, s: $x.status, t: $x.checked}]
+         | sort_by(.wr // 1e18)}'
 }
 
 # Ref of the "Claude accounts" workspace, creating it (unfocused, in ~) if it is missing.

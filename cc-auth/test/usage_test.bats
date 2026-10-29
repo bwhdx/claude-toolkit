@@ -503,3 +503,14 @@ FAKE
   for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$FAKE_DIR/cmux-desc" ] && break; sleep 0.3; done
   [ -s "$FAKE_DIR/cmux-desc" ]
 }
+
+@test "publishing lists accounts never checked, after the checked ones" {
+  fake_cmux
+  add_account checked org1 good-org1
+  add_account never org2
+  CMUX_WORKSPACE_ID=w run "$CC_AUTH" usage checked
+  local d
+  d=$(tail -1 "$FAKE_DIR/cmux-desc" | cut -f2-)
+  [ "$(jq -r '[.accounts[].n] | join(",")' <<< "$d")" = checked,never ]
+  [ "$(jq -r '.accounts[1].w' <<< "$d")" = null ]
+}
