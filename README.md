@@ -135,6 +135,14 @@ cc-auth use product               # choose one; kept until it runs out of room
 cc-auth use --auto                # pick the best account now
 ```
 
+### In cmux
+
+Inside cmux, `cc-auth` also writes every account's usage into a workspace named "Claude accounts",
+whenever sessions check usage (at most every 2 minutes) and on `cc-auth usage` or `cc-auth use`.
+A custom sidebar cannot read files or the network, so this is how it gets the figures: the areas
+sidebar in mac-setup hides that workspace and shows a usage panel from it. Outside cmux nothing
+is published.
+
 ### Working as an account
 
 ```bash

@@ -27,6 +27,7 @@ source "$CC_AUTH_ROOT/lib/vault.bash"
 source "$CC_AUTH_ROOT/lib/pools.bash"
 source "$CC_AUTH_ROOT/lib/cycling.bash"
 source "$CC_AUTH_ROOT/lib/usage.bash"
+source "$CC_AUTH_ROOT/lib/cmux.bash"
 
 # ── --pool=<name> arg parser ──────────────────────────────────────────────────
 # Extracts --pool/--pool=<name> from positional args. Echoes the pool name on
@@ -503,6 +504,7 @@ cmd_token() {
       _session_check || true
       release_lock "$CC_AUTH_SESSION_LOCK"
       name=$(state_session_account)
+      cmux_publish_usage_async
     fi
   fi
   if [[ -z "$name" ]]; then
@@ -582,6 +584,7 @@ cmd_use() {
       state_set_session_account ""
       _session_repick "$prev" || rc=$?
       release_lock "$CC_AUTH_SESSION_LOCK"
+      cmux_publish_usage
       [[ -n "$(state_session_account)" ]] || state_set_session_account "$prev"
       [[ $rc -eq 0 ]] || log_warn "No account has room; staying on $(state_session_account)"
       cmd_use
@@ -593,6 +596,7 @@ cmd_use() {
       vault_has_longterm "$arg" || { log_error "'$arg' has no long-term token (cc-auth setup-longterm $arg)"; return 1; }
       state_set_session_account "$arg"
       state_set_session_checked
+      cmux_publish_usage
       log_ok "Sessions now use '$arg'; running sessions follow within a minute"
       ;;
   esac
@@ -624,6 +628,7 @@ cmd_usage() {
   while IFS= read -r res; do
     usage_record "$res"
   done < <(jq -c '.[]' <<< "$results")
+  cmux_publish_usage
 
   if [[ "$json_output" == true ]]; then
     jq . <<< "$results"

@@ -440,3 +440,66 @@ teardown_keychain() {
   [ "$(grep '^args=' <<< "$output")" = 'args=--settings {"apiKeyHelper": ""} -c' ]
   [[ "$output" == *"pinned=none"* && "$output" == *"token=none"* ]]
 }
+
+# Fake cmux for publishing: records descriptions; the holder workspace exists once created.
+fake_cmux() {
+  cat > "$FAKE_DIR/bin/cmux" <<'FAKE'
+#!/usr/bin/env bash
+case "$1" in
+  tree)
+    if [[ -f "$FAKE_DIR/holder" ]]; then printf '{"windows":[{"workspaces":[{"title":"x","ref":"workspace:1"},{"title":"Claude accounts","ref":"workspace:7"}]}]}'
+    else printf '{"windows":[{"workspaces":[{"title":"x","ref":"workspace:1"}]}]}'; fi ;;
+  new-workspace) echo "$*" >> "$FAKE_DIR/cmux-created"; touch "$FAKE_DIR/holder" ;;
+  workspace-action) shift; while [[ $# -gt 0 ]]; do case "$1" in --workspace) ws="$2"; shift 2 ;; --description) d="$2"; shift 2 ;; *) shift ;; esac; done
+    printf '%s\t%s\n' "$ws" "$d" >> "$FAKE_DIR/cmux-desc" ;;
+esac
+FAKE
+  chmod +x "$FAKE_DIR/bin/cmux"
+}
+
+@test "usage publishes both windows of every account to cmux, soonest weekly reset first" {
+  fake_cmux
+  add_account later org1 good-org1
+  add_account sooner org2 soon-org2
+  state_set_session_account later
+  CMUX_WORKSPACE_ID=w run "$CC_AUTH" usage --json
+  [ "$status" -eq 0 ]
+  local line ws d
+  line=$(tail -1 "$FAKE_DIR/cmux-desc"); ws=${line%%$'\t'*}; d=${line#*$'\t'}
+  [ "$ws" = workspace:7 ]
+  [ "$(jq -r '.in' <<< "$d")" = later ]
+  [ "$(jq -r '[.accounts[].n] | join(",")' <<< "$d")" = sooner,later ]
+  [ "$(jq -r '.accounts[1].w' <<< "$d")" = 0.31 ]
+  [ "$(jq -r '.accounts[1].h' <<< "$d")" = 0.24 ]
+  [ "$(jq -r '.accounts[1].wr > 0 and .accounts[1].hr > 0 and .accounts[1].t > 0' <<< "$d")" = true ]
+}
+
+@test "publishing creates the Claude accounts workspace once and reuses it" {
+  fake_cmux
+  add_account a org1 good-org1
+  CMUX_WORKSPACE_ID=w run "$CC_AUTH" usage
+  CMUX_WORKSPACE_ID=w run "$CC_AUTH" usage
+  [ "$(wc -l < "$FAKE_DIR/cmux-created" | tr -d ' ')" = 1 ]
+  grep -q -- '--name Claude accounts' "$FAKE_DIR/cmux-created"
+  [ "$(wc -l < "$FAKE_DIR/cmux-desc" | tr -d ' ')" = 2 ]
+}
+
+@test "outside cmux nothing is published" {
+  fake_cmux
+  add_account a org1 good-org1
+  unset CMUX_WORKSPACE_ID
+  run "$CC_AUTH" usage
+  [ ! -e "$FAKE_DIR/cmux-desc" ]
+  [ ! -e "$FAKE_DIR/cmux-created" ]
+}
+
+@test "token: prints only the token while publishing to cmux in the background" {
+  fake_cmux
+  add_account a org1 good-org1
+  state_set_session_account a
+  CMUX_WORKSPACE_ID=w run "$CC_AUTH" token
+  [ "$status" -eq 0 ]
+  [ "$output" = good-org1 ]
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$FAKE_DIR/cmux-desc" ] && break; sleep 0.3; done
+  [ -s "$FAKE_DIR/cmux-desc" ]
+}

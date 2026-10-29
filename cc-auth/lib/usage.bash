@@ -100,6 +100,8 @@ usage_record() {
     (if .representative == "seven_day" then .seven_day else .five_hour end) as $w
     | "\($w.utilization // 0) \($w.resets_at // 0) \(.status)"' <<< "$res")
   state_update_utilization "$name" "$util" "$resets" false
+  state_set_windows "$name" "$(jq -c '{five_hour: (.five_hour // {} | {utilization, resets_at}),
+    seven_day: (.seven_day // {} | {utilization, resets_at}), status}' <<< "$res")"
   now=$(now_epoch)
   if [[ "$status" == rejected && "$resets" -gt "$now" ]]; then
     state_mark_limited "$name" $(( resets - now ))

@@ -325,6 +325,17 @@ state_set_session_checked() {
   json_edit "$CC_AUTH_STATE_FILE" --argjson now "$(now_epoch)" '.session.checked = $now'
 }
 
+# Both usage windows of an account from its last check, for displays (cmux sidebar).
+# Args: $1 = name, $2 = JSON {five_hour: {utilization, resets_at}, seven_day: {...}, status}
+state_set_windows() {
+  local name="$1" windows="$2"
+  json_edit "$CC_AUTH_STATE_FILE" \
+    --arg name "$name" \
+    --argjson w "$windows" \
+    --argjson now "$(now_epoch)" \
+    '.accounts[$name].windows = ($w + {checked: $now})'
+}
+
 # Get utilization for an account (0.0-1.0, or 999 if unknown).
 state_get_utilization() {
   local name="$1"
