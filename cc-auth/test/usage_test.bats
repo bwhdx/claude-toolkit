@@ -20,7 +20,8 @@ setup() {
   source "$TOOLKIT_ROOT/cc-auth/lib/usage.bash"
 
   # Fake API. The token (from the Authorization header on stdin) picks the response:
-  #   good-<org>     200, allowed, 5h 24% / 7d 31%
+  #   good-<org>     200, allowed, 5h 24% / 7d 31%, weekly reset in 3 days
+#   soon-<org>     the same, weekly reset in 1 day
   #   limited-<org>  429, rejected on the weekly window
   #   anything else  401, no rate-limit headers
   cat > "$FAKE_DIR/bin/curl" <<'EOF'
@@ -31,9 +32,10 @@ hdr=""; while [[ $# -gt 0 ]]; do [[ "$1" == -D ]] && hdr="$2"; shift; done
 tok=$(sed -n 's/^Authorization: Bearer //p' <<< "$stdin")
 reset5=$(( $(date +%s) + 7200 )); reset7=$(( $(date +%s) + 3 * 86400 ))
 case "$tok" in
-  good-*)
+  good-*|soon-*)
+    [[ "$tok" == soon-* ]] && reset7=$(( $(date +%s) + 86400 ))
     printf 'HTTP/2 200\r\nAnthropic-Organization-Id: %s\r\nanthropic-ratelimit-unified-status: allowed\r\nanthropic-ratelimit-unified-representative-claim: five_hour\r\nanthropic-ratelimit-unified-5h-utilization: 0.24\r\nanthropic-ratelimit-unified-5h-reset: %s\r\nanthropic-ratelimit-unified-5h-status: allowed\r\nanthropic-ratelimit-unified-7d-utilization: 0.31\r\nanthropic-ratelimit-unified-7d-reset: %s\r\nanthropic-ratelimit-unified-7d-status: allowed\r\n\r\n' \
-      "${tok#good-}" "$reset5" "$reset7" > "$hdr"
+      "${tok#*-}" "$reset5" "$reset7" > "$hdr"
     printf 200 ;;
   limited-*)
     printf 'HTTP/2 429\r\nanthropic-organization-id: %s\r\nanthropic-ratelimit-unified-status: rejected\r\nanthropic-ratelimit-unified-representative-claim: seven_day\r\nanthropic-ratelimit-unified-5h-utilization: 0.5\r\nanthropic-ratelimit-unified-5h-reset: %s\r\nanthropic-ratelimit-unified-7d-utilization: 1.0\r\nanthropic-ratelimit-unified-7d-reset: %s\r\nanthropic-ratelimit-unified-7d-status: rejected\r\n\r\n' \
@@ -132,13 +134,33 @@ add_account() {  # add_account NAME ORG [LONGTERM_TOKEN] [OAUTH_TOKEN]
   [ "$(jq -r '.[1].source' <<< "$output")" = none ]
 }
 
-@test "usage table shows percentages and what to do about a missing token" {
+@test "usage table shows bars, percentages and what to do about a missing token" {
   add_account a org1 good-org1
   add_account b org2
   run "$CC_AUTH" usage
   [ "$status" -eq 1 ]
-  [[ "$output" == *"24%"*"31%"* ]]
+  # Weekly 31% of 20 cells is 6 filled; 5-hour 24% of 10 cells is 2.
+  [[ "$output" == *"██████░░░░░░░░░░░░░░  31%"* ]]
+  [[ "$output" == *"██░░░░░░░░  24%"* ]]
   [[ "$output" == *"no token: run cc-auth setup-longterm b"* ]]
+}
+
+@test "usage table lists the soonest weekly reset first, accounts without figures last" {
+  add_account none org0
+  add_account later org1 good-org1
+  add_account sooner org2 soon-org2
+  run "$CC_AUTH" usage
+  local rows
+  rows=$(printf '%s\n' "$output" | awk '$1 ~ /^(none|later|sooner)$/ {print $1}' | paste -sd, -)
+  [ "$rows" = sooner,later,none ]
+}
+
+@test "usage bar marks any use with at least one cell and caps at full" {
+  source "$TOOLKIT_ROOT/lib/common.bash"
+  eval "$(sed -n '/^_usage_bar() {/,/^}/p' "$CC_AUTH")"
+  [ "$(_usage_bar 0.01 10)" = "█░░░░░░░░░   1%" ]
+  [ "$(_usage_bar 1.2 10)" = "██████████ 120%" ]
+  [ "$(_usage_bar 0 10)" = "░░░░░░░░░░   0%" ]
 }
 
 @test "usage rejects an unknown account" {

@@ -488,20 +488,24 @@ cmd_usage() {
 _usage_table() {
   local results="$1" now
   now=$(now_epoch)
-  echo "${BOLD}USAGE${NC} ($(jq length <<< "$results") accounts)"
+  echo "${BOLD}USAGE${NC}  $(jq length <<< "$results") accounts, soonest weekly reset first"
   echo ""
-  printf "  ${BOLD}%-12s %-30s %-18s %-18s %s${NC}\n" ACCOUNT EMAIL "5-HOUR" WEEKLY STATE
-  local name email ok http src s5 r5 s7 r7 status mismatch
-  while IFS=$'\t' read -r name email ok http src s5 r5 s7 r7 status mismatch; do
-    local c5="" c7="" state color="$GREEN"
+  printf "  ${BOLD}%-12s  %-25s  %-18s  %-15s  %-9s  %s${NC}\n" ACCOUNT WEEKLY "WEEKLY RESETS" "5-HOUR" "RESETS IN" STATE
+  local name ok http src s5 r5 s7 r7 status mismatch
+  while IFS=$'\t' read -r name ok http src s5 r5 s7 r7 status mismatch; do
+    local w5="" w7="" l5="-" l7="-" state color="$GREEN"
     if [[ "$ok" == true ]]; then
-      c5=$(_usage_cell "$s5" "$( [[ "$r5" -gt 0 ]] && format_duration $(( r5 > now ? r5 - now : 0 )) )")
-      c7=$(_usage_cell "$s7" "$( [[ "$r7" -gt 0 ]] && usage_local_time "$r7" )")
+      w5=$(_usage_bar "$s5" 10)
+      w7=$(_usage_bar "$s7" 20)
+      [[ "$r5" -gt 0 ]] && l5=$(format_duration $(( r5 > now ? r5 - now : 0 )))
+      [[ "$r7" -gt 0 ]] && l7="$(usage_local_time "$r7") ($(format_duration $(( r7 > now ? r7 - now : 0 ))))"
       state="ok"
       [[ "$src" == oauth ]] && state="ok (no long-term token)"
       if [[ "$status" == rejected ]]; then state="LIMITED"; color="$RED"; fi
       if [[ "$mismatch" == true ]]; then state="WRONG ACCOUNT: re-run setup-longterm"; color="$RED"; fi
     else
+      w5=$(_usage_bar -1 10)
+      w7=$(_usage_bar -1 20)
       color="$RED"
       case "$src:$http" in
         none:*)   state="no token: run cc-auth setup-longterm $name" ;;
@@ -510,20 +514,35 @@ _usage_table() {
         *)        state="error (HTTP $http)" ;;
       esac
     fi
-    printf "  %-12s %-30s %-18s %-18s ${color}%s${NC}\n" "$name" "$email" "${c5:--}" "${c7:--}" "$state"
-  done < <(jq -r '.[] | [.name, (.email // "?"), .ok, (.http // "-"), .source,
+    printf "  %-12s  %s  %-18s  %s  %-9s  ${color}%s${NC}\n" "$name" "$w7" "$l7" "$w5" "$l5" "$state"
+  done < <(jq -r 'sort_by(.seven_day.resets_at // 1e18) | .[] | [.name, .ok, (.http // "-"), .source,
       (.five_hour.utilization // -1), (.five_hour.resets_at // 0),
       (.seven_day.utilization // -1), (.seven_day.resets_at // 0),
       (.status // "-"), .organization_mismatch] | map(tostring) | join("\t")' <<< "$results")
   echo ""
-  echo "${DIM}  5-HOUR resets in the time shown; WEEKLY resets at the local time shown.${NC}"
+  echo "${DIM}  Weekly resets are in local time, with the time left in brackets.${NC}"
+  echo "${DIM}  Bars are green below 70%, yellow from 70% and red from 90%.${NC}"
 }
 
-# "24%  3h10m" from a 0.0-1.0 utilization and a reset label; empty when unknown.
-_usage_cell() {
-  local util="$1" label="$2"
-  [[ "$util" == -1 ]] && return 0
-  printf '%3s%%  %s' "$(jq -n --argjson u "$util" '$u * 100 | round')" "$label"
+# "█████░░░░░  34%" for a 0.0-1.0 utilization: a fixed-width bar coloured by closeness to the
+# limit, so columns line up. "-" padded to the same width when unknown (-1).
+_usage_bar() {
+  local util="$1" width="$2" pct filled color bar="" i
+  if [[ "$util" == -1 ]]; then
+    printf "%-$(( width + 5 ))s" "-"
+    return 0
+  fi
+  pct=$(jq -n --argjson u "$util" '$u * 100 | round')
+  filled=$(( (pct * width + 50) / 100 ))
+  if [[ "$pct" -gt 0 && "$filled" -eq 0 ]]; then filled=1; fi
+  if [[ "$filled" -gt "$width" ]]; then filled=$width; fi
+  color=$GREEN
+  if [[ "$pct" -ge 90 ]]; then color=$RED; elif [[ "$pct" -ge 70 ]]; then color=$YELLOW; fi
+  bar+="$color"
+  for (( i = 0; i < filled; i++ )); do bar+="█"; done
+  bar+="$NC$DIM"
+  for (( i = filled; i < width; i++ )); do bar+="░"; done
+  printf '%s%s %4s' "$bar" "$NC" "$pct%"
 }
 
 # Put back Claude Code's sign-in from before onboarding, when onboarding made an account active.

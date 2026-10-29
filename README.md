@@ -100,7 +100,8 @@ cc-auth onboard ~/accounts.txt
 cc-auth setup-longterm ops1     # replace one token (pasted at a hidden prompt, or piped in)
 ```
 
-`usage` shows each account's live 5-hour and weekly usage and when each resets. It makes a
+`usage` shows each account's live weekly and 5-hour usage as bars, with when each resets, listing
+the soonest weekly reset first. It makes a
 one-token request per account (in parallel) and reads the rate-limit headers of the response, so it
 works with long-term tokens and costs a negligible share of each account's usage. The figures are
 also recorded for cycling and `status`.
