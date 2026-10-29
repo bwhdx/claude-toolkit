@@ -441,28 +441,161 @@ cmd_setup_longterm() {
   emit_event "$CC_AUTH_DIR" "longterm_token_stored" "name=$name"
 }
 
-# Start Claude Code as an account with its long-term token: no browser sign-in and no change to
-# the keychain, so each terminal can run as a different account at the same time. The token reaches
-# Claude Code in its environment, never its arguments. Token sessions have the user:inference scope
-# only: no claude.ai connectors and no Claude in Chrome (use a normal sign-in for those).
-# Args: <name> [claude arguments...]
+# Start Claude Code as one account in this terminal, whatever the other sessions use: no browser
+# sign-in and no keychain change. With the `cc-auth token` helper installed, CC_AUTH_ACCOUNT pins
+# the helper (which takes precedence over CLAUDE_CODE_OAUTH_TOKEN); without it, the token in the
+# environment is used. Either way the token never appears in an argument list.
+# `--login` starts a session on the normal /login sign-in instead (claude.ai connectors, Claude in
+# Chrome), which token sessions lack.
+# Args: <name>|--login [claude arguments...]
 cmd_run() {
   local name="${1:-}"
-  [[ -z "$name" || "$name" == -* ]] && { log_error "Usage: cc-auth run <name> [claude arguments...]"; return 2; }
+  [[ -z "$name" || ( "$name" == -* && "$name" != --login ) ]] && { log_error "Usage: cc-auth run <name>|--login [claude arguments...]"; return 2; }
   shift
+  require_cmd claude "Claude Code CLI required" || return 1
+  # An API key in the environment would take precedence over either.
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+  if [[ "$name" == --login ]]; then
+    unset CC_AUTH_ACCOUNT CLAUDE_CODE_OAUTH_TOKEN
+    log_dim "Claude Code on this Mac's /login sign-in"
+    exec claude --settings '{"apiKeyHelper": ""}' "$@"
+  fi
+
   vault_is_initialized || { log_error "Vault not initialized"; return 1; }
   accounts_name_exists "$name" || { log_error "Unknown account: $name"; return 1; }
   vault_has_longterm "$name" || { log_error "'$name' has no long-term token (cc-auth setup-longterm $name)"; return 1; }
-  require_cmd claude "Claude Code CLI required" || return 1
-
   local token
   token=$(vault_read_longterm "$name") || return 1
   [[ -n "$token" ]] || { log_error "Long-term token for '$name' is empty"; return 1; }
   log_dim "Claude Code as $name ($(accounts_get "$name" | jq -r '.email // "?"'))"
-  # An API key in the environment would take precedence over the token.
-  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-  export CLAUDE_CODE_OAUTH_TOKEN="$token"
+  export CC_AUTH_ACCOUNT="$name" CLAUDE_CODE_OAUTH_TOKEN="$token"
   exec claude "$@"
+}
+
+CC_AUTH_SESSION_CHECK_SECS="${CC_AUTH_SESSION_CHECK_SECS:-120}"
+CC_AUTH_SESSION_LOCK="$CC_AUTH_DIR/.session.lock"
+
+# Claude Code's apiKeyHelper: prints the token every session should use now, and nothing else.
+# Claude Code re-runs it every CLAUDE_CODE_API_KEY_HELPER_TTL_MS, so a switch reaches running
+# sessions within that time. The session account's usage is checked at most every
+# CC_AUTH_SESSION_CHECK_SECS (one check shared by all sessions); when it has no room left, every
+# session moves to the account with room whose weekly window resets soonest.
+cmd_token() {
+  # Quiet: Claude Code shows helper output as an error.
+  # shellcheck disable=SC2034  # read by lib/common.bash logging
+  LOG_LEVEL=0
+  if [[ -n "${CC_AUTH_ACCOUNT:-}" ]]; then
+    vault_read_longterm "$CC_AUTH_ACCOUNT"
+    return
+  fi
+  if ! vault_is_initialized; then
+    # No accounts on this Mac yet: the /login sign-in keeps Claude Code working.
+    keychain_read | jq -r '.claudeAiOauth.accessToken // empty'
+    return
+  fi
+
+  local name checked
+  name=$(state_session_account)
+  checked=$(state_session_checked)
+  if [[ -z "$name" || $(( $(now_epoch) - checked )) -ge "$CC_AUTH_SESSION_CHECK_SECS" ]]; then
+    # Another session checking right now: use the current account meanwhile.
+    if acquire_lock "$CC_AUTH_SESSION_LOCK" 60; then
+      _session_check || true
+      release_lock "$CC_AUTH_SESSION_LOCK"
+      name=$(state_session_account)
+    fi
+  fi
+  if [[ -z "$name" ]]; then
+    name=$(_longterm_accounts | head -1)
+  fi
+  [[ -n "$name" ]] || return 1
+  vault_read_longterm "$name"
+}
+
+# Accounts with a long-term token, in registry order.
+_longterm_accounts() {
+  local n
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && vault_has_longterm "$n" && echo "$n"
+  done < <(accounts_list_names)
+  return 0
+}
+
+# Keep the session account while it has room; otherwise switch to the best account with room.
+# Caller holds CC_AUTH_SESSION_LOCK.
+_session_check() {
+  local cur res
+  cur=$(state_session_account)
+  if [[ -n "$cur" ]] && vault_has_longterm "$cur"; then
+    res=$(usage_account "$cur")
+    usage_record "$res"
+    # Still has room, or no answer (network): keep it rather than switch blind.
+    if [[ -n "$(usage_pick "[$res]")" || "$(jq -r '.http' <<< "$res")" == 0 ]]; then
+      state_set_session_checked
+      return 0
+    fi
+  fi
+  _session_repick "$cur"
+}
+
+# Probe every account and make the best one with room the session account.
+# Args: $1 = current session account (may be empty). Caller holds CC_AUTH_SESSION_LOCK.
+_session_repick() {
+  local cur="${1:-}" names=() n results res next
+  while IFS= read -r n; do names+=("$n"); done < <(_longterm_accounts)
+  [[ ${#names[@]} -gt 0 ]] || return 1
+  results=$(usage_probe_all "${names[@]}")
+  while IFS= read -r res; do usage_record "$res"; done < <(jq -c '.[]' <<< "$results")
+  next=$(usage_pick "$results")
+  state_set_session_checked
+  if [[ -z "$next" ]]; then
+    emit_event "$CC_AUTH_DIR" "session_no_room" "account=${cur:-none}"
+    # Nothing has room: keep the current account (or take the first) until one resets.
+    [[ -n "$cur" ]] || state_set_session_account "${names[0]}"
+    return 1
+  fi
+  if [[ "$next" != "$cur" ]]; then
+    state_set_session_account "$next"
+    emit_event "$CC_AUTH_DIR" "session_switched" "from=${cur:-none}" "to=$next"
+  fi
+}
+
+# Show or choose the account all sessions use (sessions started with `cc-auth run <name>` keep
+# their own). `use <name>` keeps it until it runs out of room; `use --auto` picks the best now.
+cmd_use() {
+  local arg="${1:-}"
+  vault_is_initialized || { log_error "Vault not initialized"; return 1; }
+  case "$arg" in
+    "")
+      local cur
+      cur=$(state_session_account)
+      if [[ -n "$cur" ]]; then
+        echo "Sessions use: ${BOLD}$cur${NC} ($(accounts_get "$cur" | jq -r '.email // "?"'))"
+      else
+        echo "Sessions use: no account chosen yet (the first session picks one)"
+      fi
+      ;;
+    --auto)
+      acquire_lock "$CC_AUTH_SESSION_LOCK" 60 || { log_error "Another session is switching accounts; try again"; return 1; }
+      local prev rc=0
+      prev=$(state_session_account)
+      state_set_session_account ""
+      _session_repick "$prev" || rc=$?
+      release_lock "$CC_AUTH_SESSION_LOCK"
+      [[ -n "$(state_session_account)" ]] || state_set_session_account "$prev"
+      [[ $rc -eq 0 ]] || log_warn "No account has room; staying on $(state_session_account)"
+      cmd_use
+      ;;
+    -*)
+      log_error "Usage: cc-auth use [<name>|--auto]"; return 2 ;;
+    *)
+      accounts_name_exists "$arg" || { log_error "Unknown account: $arg"; return 1; }
+      vault_has_longterm "$arg" || { log_error "'$arg' has no long-term token (cc-auth setup-longterm $arg)"; return 1; }
+      state_set_session_account "$arg"
+      state_set_session_checked
+      log_ok "Sessions now use '$arg'; running sessions follow within a minute"
+      ;;
+  esac
 }
 
 # Live 5-hour and weekly usage for every account (or the named ones), probed in parallel.
@@ -486,20 +619,11 @@ cmd_usage() {
     accounts_name_exists "$a" || { log_error "Unknown account: $a"; return 1; }
   done
 
-  local tmp i
-  tmp=$(mktemp -d) || return 1
-  for i in "${!names[@]}"; do
-    usage_account "${names[$i]}" > "$tmp/$i.json" &
-  done
-  wait
-
-  local results="[]" res
-  for i in "${!names[@]}"; do
-    res=$(cat "$tmp/$i.json")
+  local results res
+  results=$(usage_probe_all "${names[@]}")
+  while IFS= read -r res; do
     usage_record "$res"
-    results=$(jq -c --argjson r "$res" '. + [$r]' <<< "$results")
-  done
-  rm -rf "$tmp"
+  done < <(jq -c '.[]' <<< "$results")
 
   if [[ "$json_output" == true ]]; then
     jq . <<< "$results"
@@ -510,8 +634,9 @@ cmd_usage() {
 }
 
 _usage_table() {
-  local results="$1" now
+  local results="$1" now current
   now=$(now_epoch)
+  current=$(state_session_account)
   echo "${BOLD}USAGE${NC}  $(jq length <<< "$results") accounts, soonest weekly reset first"
   echo ""
   printf "  ${BOLD}%-12s  %-25s  %-18s  %-15s  %-9s  %s${NC}\n" ACCOUNT WEEKLY "WEEKLY RESETS" "5-HOUR" "RESETS IN" STATE
@@ -525,6 +650,7 @@ _usage_table() {
       [[ "$r7" -gt 0 ]] && l7="$(usage_local_time "$r7") ($(format_duration $(( r7 > now ? r7 - now : 0 ))))"
       state="ok"
       [[ "$src" == oauth ]] && state="ok (no long-term token)"
+      [[ "$name" == "$current" ]] && state="IN USE by sessions"
       if [[ "$status" == rejected ]]; then state="LIMITED"; color="$RED"; fi
       if [[ "$mismatch" == true ]]; then state="WRONG ACCOUNT: re-run setup-longterm"; color="$RED"; fi
     else
@@ -1100,7 +1226,10 @@ ${BOLD}Setup:${NC}
   refresh-all                   Check all tokens, refresh expiring ones
 
 ${BOLD}Switching:${NC}
-  run <name> [claude args...]   Start Claude Code as an account (long-term token, no browser)
+  use [<name>|--auto]           Show or choose the account all sessions use (switches when full)
+  run <name> [claude args...]   Start Claude Code as one account in this terminal only
+  run --login [claude args...]  Start Claude Code on the /login sign-in (connectors, Chrome)
+  token                         Print the sessions' token (Claude Code's apiKeyHelper)
   activate <name> [--pool=<p>]  Switch to a specific account (default pool: interactive)
   cycle [--pool=<p>]            Switch to next available account in pool
   restore                       Restore original pre-cc-auth credentials
@@ -1170,6 +1299,8 @@ main() {
     onboard)        cmd_onboard "$@" ;;
     usage)          cmd_usage "$@" ;;
     run)            cmd_run "$@" ;;
+    use)            cmd_use "$@" ;;
+    token)          cmd_token "$@" ;;
     get-token)      cmd_get_token "$@" ;;
     pool)           cmd_pool "$@" ;;
     schedule)       cmd_schedule "$@" ;;

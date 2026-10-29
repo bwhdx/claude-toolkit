@@ -110,3 +110,35 @@ usage_record() {
 usage_local_time() {
   date -r "$1" '+%a %H:%M' 2>/dev/null || date -d "@$1" '+%a %H:%M'
 }
+
+# Usage of several accounts, probed in parallel. Prints a JSON array in the order given.
+# Args: account names
+usage_probe_all() {
+  local tmp i=0 name results="[]"
+  tmp=$(mktemp -d) || return 1
+  for name in "$@"; do
+    usage_account "$name" > "$tmp/$i.json" &
+    i=$((i + 1))
+  done
+  wait
+  for (( i = 0; i < $#; i++ )); do
+    results=$(jq -c --slurpfile r "$tmp/$i.json" '. + $r' <<< "$results")
+  done
+  rm -rf "$tmp"
+  echo "$results"
+}
+
+# Share of either window at which an account counts as full: switching just before the limit
+# avoids a session being stopped mid-task.
+CC_AUTH_SWITCH_AT="${CC_AUTH_SWITCH_AT:-0.95}"
+
+# The account to use: of those with room (read, not rejected, both windows below the switch
+# threshold, with a long-term token), the one whose weekly window resets soonest, so capacity
+# about to reset is used first.
+# Args: $1 = JSON array of usage_account results. Prints a name, or nothing when none has room.
+usage_pick() {
+  jq -r --argjson at "$CC_AUTH_SWITCH_AT" '
+    [.[] | select(.ok and .source == "longterm" and .status != "rejected" and (.organization_mismatch | not)
+                  and (.five_hour.utilization // 0) < $at and (.seven_day.utilization // 0) < $at)]
+    | sort_by(.seven_day.resets_at // 1e18) | .[0].name // empty' <<< "$1"
+}

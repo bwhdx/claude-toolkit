@@ -111,17 +111,42 @@ cc-auth usage                   # table; exit 1 if any account could not be read
 cc-auth usage ops1 --json
 ```
 
+### One account for every session, switching when it runs out
+
+With `cc-auth token` as Claude Code's `apiKeyHelper`, every session uses one shared account and
+follows it when it changes, without a restart:
+
+```json
+{
+  "apiKeyHelper": "$HOME/.local/bin/cc-auth token",
+  "env": { "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "60000" }
+}
+```
+
+Claude Code asks the helper for a token every minute. The helper checks the shared account's usage
+at most every 2 minutes (`CC_AUTH_SESSION_CHECK_SECS`, one check for all sessions). Once the
+account is limited or past 95% of either window (`CC_AUTH_SWITCH_AT`), every session moves to the
+account with room whose weekly window resets soonest. Switches are logged as `session_switched`
+in `~/.cc-auth/events.jsonl`.
+
+```bash
+cc-auth use                       # which account sessions use
+cc-auth use product               # choose one; kept until it runs out of room
+cc-auth use --auto                # pick the best account now
+```
+
 ### Working as an account
 
 ```bash
 cc-auth run technology            # Claude Code as technology@, in this terminal only
 cc-auth run product -c            # extra arguments go to claude
+cc-auth run --login               # the /login sign-in, with connectors and Claude in Chrome
 ```
 
-`run` starts Claude Code with the account's long-term token in its environment: no browser
-sign-in, nothing written to the keychain, and different terminals can run as different accounts
-at once. Token sessions have no claude.ai connectors (Gmail, Drive, ...) and no Claude in Chrome;
-use `/login` for an account when you need those.
+`run <name>` keeps one terminal on an account whatever the shared account is: no browser sign-in,
+nothing written to the keychain. Token sessions have no claude.ai connectors (Gmail, Drive, ...)
+and no Claude in Chrome; `cc-auth run --login` starts a session on the normal `/login` sign-in
+for those.
 
 ### Pools
 

@@ -22,6 +22,8 @@ setup() {
   # Fake API. The token (from the Authorization header on stdin) picks the response:
   #   good-<org>     200, allowed, 5h 24% / 7d 31%, weekly reset in 3 days
 #   soon-<org>     the same, weekly reset in 1 day
+#   hot-<org>      the same, but 5h at 96% (past the switch threshold)
+#   down-*         no response (curl fails, status 000)
   #   limited-<org>  429, rejected on the weekly window
   #   anything else  401, no rate-limit headers
   cat > "$FAKE_DIR/bin/curl" <<'EOF'
@@ -32,9 +34,11 @@ hdr=""; while [[ $# -gt 0 ]]; do [[ "$1" == -D ]] && hdr="$2"; shift; done
 tok=$(sed -n 's/^Authorization: Bearer //p' <<< "$stdin")
 reset5=$(( $(date +%s) + 7200 )); reset7=$(( $(date +%s) + 3 * 86400 ))
 case "$tok" in
-  good-*|soon-*)
+  down-*) printf '000'; exit 7 ;;
+  good-*|soon-*|hot-*)
     [[ "$tok" == soon-* ]] && reset7=$(( $(date +%s) + 86400 ))
-    printf 'HTTP/2 200\r\nAnthropic-Organization-Id: %s\r\nanthropic-ratelimit-unified-status: allowed\r\nanthropic-ratelimit-unified-representative-claim: five_hour\r\nanthropic-ratelimit-unified-5h-utilization: 0.24\r\nanthropic-ratelimit-unified-5h-reset: %s\r\nanthropic-ratelimit-unified-5h-status: allowed\r\nanthropic-ratelimit-unified-7d-utilization: 0.31\r\nanthropic-ratelimit-unified-7d-reset: %s\r\nanthropic-ratelimit-unified-7d-status: allowed\r\n\r\n' \
+    u5=0.24; [[ "$tok" == hot-* ]] && u5=0.96
+    printf 'HTTP/2 200\r\nAnthropic-Organization-Id: %s\r\nanthropic-ratelimit-unified-status: allowed\r\nanthropic-ratelimit-unified-representative-claim: five_hour\r\nanthropic-ratelimit-unified-5h-utilization: '"$u5"'\r\nanthropic-ratelimit-unified-5h-reset: %s\r\nanthropic-ratelimit-unified-5h-status: allowed\r\nanthropic-ratelimit-unified-7d-utilization: 0.31\r\nanthropic-ratelimit-unified-7d-reset: %s\r\nanthropic-ratelimit-unified-7d-status: allowed\r\n\r\n' \
       "${tok#*-}" "$reset5" "$reset7" > "$hdr"
     printf 200 ;;
   limited-*)
@@ -308,4 +312,131 @@ teardown_keychain() {
   [ "$status" -eq 1 ]
   [[ "$output" == *"no long-term token"* ]]
   [ ! -e "$FAKE_DIR/claude-calls" ]
+}
+
+@test "usage_pick takes the soonest weekly reset among accounts with room" {
+  local r='[
+    {"name":"later","ok":true,"source":"longterm","status":"allowed","organization_mismatch":false,"five_hour":{"utilization":0.1},"seven_day":{"utilization":0.1,"resets_at":300}},
+    {"name":"full","ok":true,"source":"longterm","status":"allowed","organization_mismatch":false,"five_hour":{"utilization":0.96},"seven_day":{"utilization":0.1,"resets_at":100}},
+    {"name":"limited","ok":true,"source":"longterm","status":"rejected","organization_mismatch":false,"five_hour":{"utilization":0.5},"seven_day":{"utilization":1.0,"resets_at":50}},
+    {"name":"sooner","ok":true,"source":"longterm","status":"allowed","organization_mismatch":false,"five_hour":{"utilization":0.9},"seven_day":{"utilization":0.5,"resets_at":200}},
+    {"name":"oauth","ok":true,"source":"oauth","status":"allowed","organization_mismatch":false,"five_hour":{"utilization":0},"seven_day":{"utilization":0,"resets_at":10}}]'
+  [ "$(usage_pick "$r")" = sooner ]
+  [ -z "$(usage_pick '[]')" ]
+}
+
+@test "token: the first session picks the account with the soonest weekly reset" {
+  add_account later org1 good-org1
+  add_account sooner org2 soon-org2
+  run "$CC_AUTH" token
+  [ "$status" -eq 0 ]
+  [ "$output" = soon-org2 ]
+  [ "$(state_session_account)" = sooner ]
+}
+
+@test "token: keeps the account without any request while its last check is recent" {
+  add_account a org1 good-org1
+  add_account b org2 soon-org2
+  state_set_session_account a
+  state_set_session_checked
+  run "$CC_AUTH" token
+  [ "$output" = good-org1 ]
+  [ ! -e "$FAKE_DIR/argv" ]
+}
+
+@test "token: keeps an account with room after a check" {
+  add_account a org1 good-org1
+  add_account b org2 soon-org2
+  state_set_session_account a
+  run "$CC_AUTH" token
+  [ "$output" = good-org1 ]
+  [ "$(wc -l < "$FAKE_DIR/argv" | tr -d ' ')" = 1 ]
+}
+
+@test "token: moves every session to another account when the current one is limited" {
+  add_account a org1 limited-org1
+  add_account b org2 good-org2
+  add_account c org3 soon-org3
+  state_set_session_account a
+  run "$CC_AUTH" token
+  [ "$output" = soon-org3 ]
+  [ "$(state_session_account)" = c ]
+  grep -q '"session_switched"' "$CC_AUTH_DIR"/*.jsonl
+}
+
+@test "token: switches before the limit, once a window passes the threshold" {
+  add_account a org1 hot-org1
+  add_account b org2 good-org2
+  state_set_session_account a
+  run "$CC_AUTH" token
+  [ "$output" = good-org2 ]
+}
+
+@test "token: keeps the account when the check gets no response" {
+  add_account a org1 down-org1
+  add_account b org2 good-org2
+  state_set_session_account a
+  run "$CC_AUTH" token
+  [ "$output" = down-org1 ]
+  [ "$(state_session_account)" = a ]
+}
+
+@test "token: stays on the current account when no account has room" {
+  add_account a org1 limited-org1
+  add_account b org2 limited-org2
+  state_set_session_account a
+  run "$CC_AUTH" token
+  [ "$output" = limited-org1 ]
+  [ "$(state_session_account)" = a ]
+}
+
+@test "token: a session started with run stays on its account" {
+  add_account a org1 good-org1
+  add_account b org2 soon-org2
+  state_set_session_account b
+  CC_AUTH_ACCOUNT=a run "$CC_AUTH" token
+  [ "$output" = good-org1 ]
+}
+
+@test "token: another session holding the check lock does not block or empty the token" {
+  add_account a org1 good-org1
+  state_set_session_account a
+  mkdir "$CC_AUTH_DIR/.session.lock"; echo $$ > "$CC_AUTH_DIR/.session.lock/pid"; date +%s > "$CC_AUTH_DIR/.session.lock/created"
+  run "$CC_AUTH" token
+  [ "$output" = good-org1 ]
+}
+
+@test "use: sets, shows and re-picks the session account" {
+  add_account a org1 good-org1
+  add_account b org2 soon-org2
+  add_account c org3
+  run "$CC_AUTH" use a
+  [ "$status" -eq 0 ]
+  [ "$(state_session_account)" = a ]
+  run "$CC_AUTH" use
+  [[ "$output" == *"Sessions use: a"* ]]
+  run "$CC_AUTH" use c
+  [ "$status" -eq 1 ]
+  run "$CC_AUTH" use --auto
+  [ "$(state_session_account)" = b ]
+}
+
+@test "usage table marks the account sessions use" {
+  add_account a org1 good-org1
+  add_account b org2 soon-org2
+  state_set_session_account a
+  run "$CC_AUTH" usage
+  [[ "$(grep '^  a ' <<< "$output")" == *"IN USE by sessions"* ]]
+  [[ "$(grep '^  b ' <<< "$output")" != *"IN USE"* ]]
+}
+
+@test "run pins the helper to its account; run --login turns the helper off" {
+  add_account a org1 good-org1
+  printf '#!/usr/bin/env bash\necho "args=$*"\necho "pinned=${CC_AUTH_ACCOUNT:-none}"\necho "token=${CLAUDE_CODE_OAUTH_TOKEN:-none}"\n' > "$FAKE_DIR/bin/claude"
+  chmod +x "$FAKE_DIR/bin/claude"
+  run "$CC_AUTH" run a
+  [[ "$output" == *"pinned=a"* ]]
+  CC_AUTH_ACCOUNT=a CLAUDE_CODE_OAUTH_TOKEN=x run "$CC_AUTH" run --login -c
+  [ "$(grep '^args=' <<< "$output")" = 'args=--settings {"apiKeyHelper": ""} -c' ]
+  [[ "$output" == *"pinned=none"* && "$output" == *"token=none"* ]]
 }

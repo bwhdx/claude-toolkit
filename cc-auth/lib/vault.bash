@@ -304,6 +304,27 @@ state_update_utilization() {
      .accounts[$name].utilization_updated = $updated'
 }
 
+# ── Shared session account (the apiKeyHelper's choice) ────────────────────────
+
+# Account every Claude Code session uses through `cc-auth token`
+state_session_account() {
+  jq -r '.session.account // empty' "$CC_AUTH_STATE_FILE" 2>/dev/null
+}
+
+state_set_session_account() {
+  local name="$1"
+  json_edit "$CC_AUTH_STATE_FILE" --arg name "$name" '.session.account = $name'
+}
+
+# When the session account's usage was last checked (epoch, 0 if never)
+state_session_checked() {
+  jq -r '.session.checked // 0' "$CC_AUTH_STATE_FILE" 2>/dev/null || echo 0
+}
+
+state_set_session_checked() {
+  json_edit "$CC_AUTH_STATE_FILE" --argjson now "$(now_epoch)" '.session.checked = $now'
+}
+
 # Get utilization for an account (0.0-1.0, or 999 if unknown).
 state_get_utilization() {
   local name="$1"
