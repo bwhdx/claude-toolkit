@@ -316,6 +316,15 @@ state_set_session_account() {
   json_edit "$CC_AUTH_STATE_FILE" --arg name "$name" '.session.account = $name'
 }
 
+# Chosen by hand with `cc-auth use NAME`: kept until full, not moved to a better account.
+state_session_pinned() {
+  [[ "$(jq -r '.session.pinned // false' "$CC_AUTH_STATE_FILE" 2>/dev/null)" == true ]]
+}
+
+state_set_session_pinned() {
+  json_edit "$CC_AUTH_STATE_FILE" --argjson p "$1" '.session.pinned = $p'
+}
+
 # When the session account's usage was last checked (epoch, 0 if never)
 state_session_checked() {
   jq -r '.session.checked // 0' "$CC_AUTH_STATE_FILE" 2>/dev/null || echo 0

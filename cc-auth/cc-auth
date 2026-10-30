@@ -526,8 +526,25 @@ _longterm_accounts() {
 # Keep the session account while it has room; otherwise switch to the best account with room.
 # Caller holds CC_AUTH_SESSION_LOCK.
 _session_check() {
-  local cur res
+  local cur res pref
   cur=$(state_session_account)
+  # Move back to the preferred account (soonest weekly reset with room) once it has room again,
+  # e.g. after its 5-hour window resets. Its last check suggests it; one live check confirms it.
+  if [[ -n "$cur" ]] && ! state_session_pinned; then
+    local names=() n
+    while IFS= read -r n; do names+=("$n"); done < <(_longterm_accounts)
+    pref=$(usage_preferred_cached "${names[@]}")
+    if [[ -n "$pref" && "$pref" != "$cur" ]]; then
+      res=$(usage_account "$pref")
+      usage_record "$res"
+      if [[ -n "$(usage_pick "[$res]")" ]]; then
+        state_set_session_account "$pref"
+        state_set_session_checked
+        emit_event "$CC_AUTH_DIR" "session_switched" "from=$cur" "to=$pref" "reason=preferred"
+        return 0
+      fi
+    fi
+  fi
   if [[ -n "$cur" ]] && vault_has_longterm "$cur"; then
     res=$(usage_account "$cur")
     usage_record "$res"
@@ -558,6 +575,8 @@ _session_repick() {
   fi
   if [[ "$next" != "$cur" ]]; then
     state_set_session_account "$next"
+    # A hand-picked account that ran out stops being pinned: the choice is automatic again.
+    state_set_session_pinned false
     emit_event "$CC_AUTH_DIR" "session_switched" "from=${cur:-none}" "to=$next"
   fi
 }
@@ -572,7 +591,7 @@ cmd_use() {
       local cur
       cur=$(state_session_account)
       if [[ -n "$cur" ]]; then
-        echo "Sessions use: ${BOLD}$cur${NC} ($(accounts_get "$cur" | jq -r '.email // "?"'))"
+        echo "Sessions use: ${BOLD}$cur${NC} ($(accounts_get "$cur" | jq -r '.email // "?"'))$(state_session_pinned && echo ", chosen by hand")"
       else
         echo "Sessions use: no account chosen yet (the first session picks one)"
       fi
@@ -582,6 +601,7 @@ cmd_use() {
       local prev rc=0
       prev=$(state_session_account)
       state_set_session_account ""
+      state_set_session_pinned false
       _session_repick "$prev" || rc=$?
       release_lock "$CC_AUTH_SESSION_LOCK"
       cmux_publish_usage
@@ -595,9 +615,10 @@ cmd_use() {
       accounts_name_exists "$arg" || { log_error "Unknown account: $arg"; return 1; }
       vault_has_longterm "$arg" || { log_error "'$arg' has no long-term token (cc-auth setup-longterm $arg)"; return 1; }
       state_set_session_account "$arg"
+      state_set_session_pinned true
       state_set_session_checked
       cmux_publish_usage
-      log_ok "Sessions now use '$arg'; running sessions follow within a minute"
+      log_ok "Sessions now use '$arg' until it is full ('cc-auth use --auto' to go back to automatic); running sessions follow within a minute"
       ;;
   esac
 }

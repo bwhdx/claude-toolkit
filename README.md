@@ -126,13 +126,15 @@ follows it when it changes, without a restart:
 Claude Code asks the helper for a token every minute. The helper checks the shared account's usage
 at most every 2 minutes (`CC_AUTH_SESSION_CHECK_SECS`, one check for all sessions). Once the
 account is limited or past 95% of either window (`CC_AUTH_SWITCH_AT`), every session moves to the
-account with room whose weekly window resets soonest. Switches are logged as `session_switched`
+account with room whose weekly window resets soonest. It also moves back: when the account with the
+soonest weekly reset has room again (say its 5-hour window reset), sessions return to it, so the
+allowance about to reset is always used first. Switches are logged as `session_switched`
 in `~/.cc-auth/events.jsonl`.
 
 ```bash
 cc-auth use                       # which account sessions use
 cc-auth use product               # choose one; kept until it runs out of room
-cc-auth use --auto                # pick the best account now
+cc-auth use --auto                # back to automatic, picking the best account now
 ```
 
 ### In cmux

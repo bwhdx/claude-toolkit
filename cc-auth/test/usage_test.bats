@@ -514,3 +514,70 @@ FAKE
   [ "$(jq -r '[.accounts[].n] | join(",")' <<< "$d")" = checked,never ]
   [ "$(jq -r '.accounts[1].w' <<< "$d")" = null ]
 }
+
+# Last-check figures for an account, as usage_record stores them.
+cached() {  # cached NAME 5H_UTIL 5H_RESET WEEKLY_UTIL WEEKLY_RESET
+  state_set_windows "$1" "{\"five_hour\":{\"utilization\":$2,\"resets_at\":$3},\"seven_day\":{\"utilization\":$4,\"resets_at\":$5},\"status\":\"allowed\"}"
+}
+
+@test "usage_preferred_cached counts a window past its reset as empty" {
+  add_account a org1 good-org1
+  add_account b org2 good-org2
+  local now; now=$(date +%s)
+  cached a 0.96 $((now - 60)) 0.67 $((now + 3600))     # 5h full, but reset a minute ago
+  cached b 0.28 $((now + 9000)) 0.44 $((now + 60000))
+  [ "$(usage_preferred_cached a b)" = a ]
+  cached a 0.96 $((now + 600)) 0.67 $((now + 3600))     # 5h full until later
+  [ "$(usage_preferred_cached a b)" = b ]
+}
+
+@test "usage_preferred_cached puts a passed weekly reset a week later" {
+  add_account a org1 good-org1
+  add_account b org2 good-org2
+  local now; now=$(date +%s)
+  cached a 0.1 $((now + 600)) 0.9 $((now - 60))        # weekly just reset: next one in ~7 days
+  cached b 0.1 $((now + 600)) 0.4 $((now + 86400))
+  [ "$(usage_preferred_cached a b)" = b ]
+}
+
+@test "token: moves back to the soonest weekly reset once it has room again" {
+  add_account sooner org1 soon-org1
+  add_account later org2 good-org2
+  local now; now=$(date +%s)
+  cached sooner 0.96 $((now - 60)) 0.67 $((now + 86400))
+  cached later 0.28 $((now + 9000)) 0.44 $((now + 3 * 86400))
+  state_set_session_account later
+  run "$CC_AUTH" token
+  [ "$output" = soon-org1 ]
+  [ "$(state_session_account)" = sooner ]
+  grep -q '"reason":"preferred"' "$CC_AUTH_DIR/events.jsonl"
+}
+
+@test "token: stays put when the preferred account turns out to have no room" {
+  add_account sooner org1 limited-org1
+  add_account later org2 good-org2
+  local now; now=$(date +%s)
+  cached sooner 0.2 $((now + 600)) 0.5 $((now + 86400))   # looked fine at its last check
+  cached later 0.28 $((now + 9000)) 0.44 $((now + 3 * 86400))
+  state_set_session_account later
+  run "$CC_AUTH" token
+  [ "$output" = good-org2 ]
+  [ "$(state_session_account)" = later ]
+}
+
+@test "token: an account chosen with use stays until full; use --auto ends that" {
+  add_account sooner org1 soon-org1
+  add_account later org2 good-org2
+  local now; now=$(date +%s)
+  cached sooner 0.1 $((now + 600)) 0.1 $((now + 86400))
+  cached later 0.1 $((now + 600)) 0.1 $((now + 3 * 86400))
+  run "$CC_AUTH" use later
+  [[ "$output" == *"until it is full"* ]]
+  state_set_session_checked_at() { json_edit "$CC_AUTH_STATE_FILE" '.session.checked = 0'; }
+  state_set_session_checked_at
+  run "$CC_AUTH" token
+  [ "$output" = good-org2 ]
+  run "$CC_AUTH" use --auto
+  [ "$(state_session_account)" = sooner ]
+  ! state_session_pinned
+}

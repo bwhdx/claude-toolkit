@@ -144,3 +144,23 @@ usage_pick() {
                   and (.five_hour.utilization // 0) < $at and (.seven_day.utilization // 0) < $at)]
     | sort_by(.seven_day.resets_at // 1e18) | .[0].name // empty' <<< "$1"
 }
+
+# The account sessions should be on, judged from each account's last check alone (no requests):
+# of the given accounts, the one with room whose weekly window resets soonest. A window whose reset
+# time has passed counts as empty, and its next weekly reset as a week later. Accounts never
+# checked are left out. Prints a name, or nothing.
+# Args: account names
+usage_preferred_cached() {
+  [[ $# -gt 0 ]] || return 0
+  # --args makes every word after the filter an argument, so the state file comes in on stdin.
+  jq -r --argjson now "$(now_epoch)" --argjson at "$CC_AUTH_SWITCH_AT" \
+    --args '
+    def eff($w): if ($w.resets_at // 0) > 0 and $w.resets_at <= $now then 0 else ($w.utilization // 0) end;
+    def wreset($w): ($w.resets_at // 1e18) | if . <= $now then . + 604800 else . end;
+    . as $s
+    | [$ARGS.positional[] as $n | $s.accounts[$n] as $a | select($a.windows)
+       | select(($a.limited_until // 0) <= $now)
+       | {n: $n, h: eff($a.windows.five_hour), w: eff($a.windows.seven_day), r: wreset($a.windows.seven_day)}
+       | select(.h < $at and .w < $at)]
+    | sort_by(.r) | .[0].n // empty' "$@" < "$CC_AUTH_STATE_FILE"
+}
