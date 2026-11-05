@@ -70,6 +70,17 @@ All tools use codes from `pkg/exitcodes/`:
 
 These are the stable output shapes consumers can depend on. All tools support `--json`.
 
+### `cc-auth pick [--leftover [--current NAME]] --json`
+
+One line; exit 77 when no account is usable. `reason` is `room` (plain `pick`), or for
+`--leftover` one of `leftover`, `fallback`, `no-answer`. Never contains a token.
+
+```json
+{"account": "legal", "reason": "leftover",
+ "five_hour": {"utilization": 0.1, "resets_at": 1794000000, "status": "allowed"},
+ "seven_day": {"utilization": 0.96, "resets_at": 1794247200, "status": "allowed_warning"}}
+```
+
 ### `cc-auth list --json`
 
 ```json

@@ -581,6 +581,53 @@ _session_repick() {
   fi
 }
 
+# Check every account live and print the one a policy picks, without changing what sessions use.
+# The figures are recorded in state, as `usage` does.
+#   pick              the account sessions would pick: room, soonest weekly reset
+#   pick --leftover   the account a background agent should use to spend what sessions leave
+#                     behind (usage_pick_leftover); --current NAME is the account it is on now
+# Prints the name, or with --json {account, reason, five_hour, seven_day}.
+# Exit: 0 picked, 2 usage error, 77 no account usable (all limited, or none could be checked).
+cmd_pick() {
+  local leftover=false json_output=false cur=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --leftover) leftover=true; shift ;;
+      --current)  cur="${2:-}"; [[ -n "$cur" ]] || { log_error "--current needs an account name"; return 2; }; shift 2 ;;
+      --current=*) cur="${1#--current=}"; shift ;;
+      --json)     json_output=true; shift ;;
+      *)          log_error "Usage: cc-auth pick [--leftover [--current <name>]] [--json]"; return 2 ;;
+    esac
+  done
+  [[ -z "$cur" || "$leftover" == true ]] || { log_error "--current applies to --leftover only"; return 2; }
+  vault_is_initialized || { log_error "Vault not initialized (run 'cc-auth init')"; return 1; }
+  [[ -z "$cur" ]] || accounts_name_exists "$cur" || { log_error "Unknown account: $cur"; return 2; }
+
+  local names=() n results res picked
+  while IFS= read -r n; do names+=("$n"); done < <(_longterm_accounts)
+  [[ ${#names[@]} -gt 0 ]] || { log_error "No account has a long-term token (cc-auth setup-longterm <name>)"; return 77; }
+  # Probe outside the lock (up to 30 s); record under it, so sessions' own writes are not lost.
+  results=$(usage_probe_all "${names[@]}")
+  if acquire_lock "$CC_AUTH_SESSION_LOCK" 60; then
+    while IFS= read -r res; do usage_record "$res"; done < <(jq -c '.[]' <<< "$results")
+    release_lock "$CC_AUTH_SESSION_LOCK"
+  fi
+
+  if [[ "$leftover" == true ]]; then
+    picked=$(usage_pick_leftover "$results" "$cur")
+  else
+    n=$(usage_pick "$results")
+    [[ -z "$n" ]] || picked=$(jq -c --arg n "$n" '.[] | select(.name == $n)
+      | {account: .name, reason: "room", five_hour, seven_day}' <<< "$results")
+  fi
+  [[ -n "$picked" ]] || { log_error "No account is usable now"; return 77; }
+  if [[ "$json_output" == true ]]; then
+    echo "$picked"
+  else
+    jq -r '.account' <<< "$picked"
+  fi
+}
+
 # Show or choose the account all sessions use (sessions started with `cc-auth run <name>` keep
 # their own). `use <name>` keeps it until it runs out of room; `use --auto` picks the best now.
 cmd_use() {
@@ -1256,6 +1303,9 @@ ${BOLD}Switching:${NC}
   run <name> [claude args...]   Start Claude Code as one account in this terminal only
   run --login [claude args...]  Start Claude Code on the /login sign-in (connectors, Chrome)
   token                         Print the sessions' token (Claude Code's apiKeyHelper)
+  pick [--leftover [--current <n>]] [--json]
+                                Check every account and print the one sessions would use,
+                                or with --leftover the one to spend sessions' leftovers on
   activate <name> [--pool=<p>]  Switch to a specific account (default pool: interactive)
   cycle [--pool=<p>]            Switch to next available account in pool
   restore                       Restore original pre-cc-auth credentials
@@ -1327,6 +1377,7 @@ main() {
     run)            cmd_run "$@" ;;
     use)            cmd_use "$@" ;;
     token)          cmd_token "$@" ;;
+    pick)           cmd_pick "$@" ;;
     get-token)      cmd_get_token "$@" ;;
     pool)           cmd_pool "$@" ;;
     schedule)       cmd_schedule "$@" ;;

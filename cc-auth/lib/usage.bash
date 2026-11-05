@@ -164,3 +164,38 @@ usage_preferred_cached() {
        | select(.h < $at and .w < $at)]
     | sort_by(.r) | .[0].n // empty' "$@" < "$CC_AUTH_STATE_FILE"
 }
+
+# Ceiling for spending what sessions leave behind: past this share of either window an account is
+# left alone, so the last sliver is a buffer rather than a turn cut off part-way.
+CC_AUTH_LEFTOVER_STOP="${CC_AUTH_LEFTOVER_STOP:-0.99}"
+
+# The account a background agent should use so that it spends what sessions leave behind.
+# Leftover accounts are those sessions have left for the rest of the week: weekly window at or past
+# the switch threshold, both windows still below CC_AUTH_LEFTOVER_STOP, not rejected. Sessions do
+# not return to them before their weekly reset, so the agent costs the sessions nothing there.
+# Each change of account costs the agent a fresh session, so it moves only when it must:
+#   1. the current account, while it is still leftover, or while its check got no answer;
+#   2. else the leftover account whose weekly window resets soonest;
+#   3. else (nothing left over) the current account while it has room by the sessions' rule;
+#   4. else the account sessions would pick: room, soonest weekly reset.
+# Args: $1 = JSON array of usage_account results, $2 = current account (may be empty)
+# Prints {account, reason (leftover|fallback|no-answer), five_hour, seven_day} on one line, or
+# nothing when no account is usable.
+usage_pick_leftover() {
+  jq -c --argjson at "$CC_AUTH_SWITCH_AT" --argjson stop "$CC_AUTH_LEFTOVER_STOP" --arg cur "${2:-}" '
+    def h: .five_hour.utilization // 0;
+    def w: .seven_day.utilization // 0;
+    def soonest: sort_by(.seven_day.resets_at // 1e18) | .[0];
+    def out($r): {account: .name, reason: $r, five_hour, seven_day};
+    [.[] | select(.ok and .source == "longterm" and .status != "rejected"
+                  and (.organization_mismatch | not))] as $usable
+    | [$usable[] | select(w >= $at and w < $stop and h < $stop)] as $left
+    | [$usable[] | select(w < $at and h < $at)] as $room
+    | [.[] | select(.name == $cur)] as $mine
+    | if $cur != "" and ($mine | length) > 0 and $mine[0].http == 0 then $mine[0] | out("no-answer")
+      elif ([$left[] | select(.name == $cur)] | length) > 0 then $left[] | select(.name == $cur) | out("leftover")
+      elif ($left | length) > 0 then $left | soonest | out("leftover")
+      elif ([$room[] | select(.name == $cur)] | length) > 0 then $room[] | select(.name == $cur) | out("fallback")
+      elif ($room | length) > 0 then $room | soonest | out("fallback")
+      else empty end' <<< "$1"
+}

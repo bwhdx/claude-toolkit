@@ -137,6 +137,29 @@ cc-auth use product               # choose one; kept until it runs out of room
 cc-auth use --auto                # back to automatic, picking the best account now
 ```
 
+### Spending what sessions leave behind
+
+Sessions leave an account at 95% of a window, so each week every account they move off still has
+up to 5% unused. `cc-auth pick --leftover` names the account a background agent should use to
+spend that: of the accounts sessions have left for the week (weekly window at or past
+`CC_AUTH_SWITCH_AT`, both windows below `CC_AUTH_LEFTOVER_STOP`, default 99%, not rejected), the
+one whose weekly window resets soonest. Sessions do not go back to those accounts before their
+weekly reset, so the agent takes nothing from them. With nothing left over it names the account
+sessions would pick.
+
+Each change of account costs the agent a fresh session, so with `--current NAME` the agent's
+account is kept while it is still left over (or while its check got no answer), and while it still
+has room when nothing is left over.
+
+```bash
+cc-auth pick                                  # the account sessions would pick, checked live
+cc-auth pick --leftover --current legal --json
+CC_AUTH_ACCOUNT=legal cc-auth token | some-agent-login   # its token, on a pipe only
+```
+
+`pick` checks every account live, records the figures as `usage` does, and never changes the
+account sessions use. It exits 77 when no account is usable.
+
 ### In cmux
 
 Inside cmux, `cc-auth` also writes every account's usage into a workspace named "Claude accounts",
