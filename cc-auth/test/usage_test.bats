@@ -22,7 +22,7 @@ setup() {
   # Fake API. The token (from the Authorization header on stdin) picks the response:
   #   good-<org>     200, allowed, 5h 24% / 7d 31%, weekly reset in 3 days
 #   soon-<org>     the same, weekly reset in 1 day
-#   hot-<org>      the same, but 5h at 96% (past the switch threshold)
+#   hot-<org>      the same, but 5h at 99.5% (past the switch threshold)
 #   down-*         no response (curl fails, status 000)
   #   limited-<org>  429, rejected on the weekly window
   #   anything else  401, no rate-limit headers
@@ -37,7 +37,7 @@ case "$tok" in
   down-*) printf '000'; exit 7 ;;
   good-*|soon-*|hot-*)
     [[ "$tok" == soon-* ]] && reset7=$(( $(date +%s) + 86400 ))
-    u5=0.24; [[ "$tok" == hot-* ]] && u5=0.96
+    u5=0.24; [[ "$tok" == hot-* ]] && u5=0.995
     printf 'HTTP/2 200\r\nAnthropic-Organization-Id: %s\r\nanthropic-ratelimit-unified-status: allowed\r\nanthropic-ratelimit-unified-representative-claim: five_hour\r\nanthropic-ratelimit-unified-5h-utilization: '"$u5"'\r\nanthropic-ratelimit-unified-5h-reset: %s\r\nanthropic-ratelimit-unified-5h-status: allowed\r\nanthropic-ratelimit-unified-7d-utilization: 0.31\r\nanthropic-ratelimit-unified-7d-reset: %s\r\nanthropic-ratelimit-unified-7d-status: allowed\r\n\r\n' \
       "${tok#*-}" "$reset5" "$reset7" > "$hdr"
     printf 200 ;;
@@ -317,7 +317,7 @@ teardown_keychain() {
 @test "usage_pick takes the soonest weekly reset among accounts with room" {
   local r='[
     {"name":"later","ok":true,"source":"longterm","status":"allowed","organization_mismatch":false,"five_hour":{"utilization":0.1},"seven_day":{"utilization":0.1,"resets_at":300}},
-    {"name":"full","ok":true,"source":"longterm","status":"allowed","organization_mismatch":false,"five_hour":{"utilization":0.96},"seven_day":{"utilization":0.1,"resets_at":100}},
+    {"name":"full","ok":true,"source":"longterm","status":"allowed","organization_mismatch":false,"five_hour":{"utilization":0.995},"seven_day":{"utilization":0.1,"resets_at":100}},
     {"name":"limited","ok":true,"source":"longterm","status":"rejected","organization_mismatch":false,"five_hour":{"utilization":0.5},"seven_day":{"utilization":1.0,"resets_at":50}},
     {"name":"sooner","ok":true,"source":"longterm","status":"allowed","organization_mismatch":false,"five_hour":{"utilization":0.9},"seven_day":{"utilization":0.5,"resets_at":200}},
     {"name":"oauth","ok":true,"source":"oauth","status":"allowed","organization_mismatch":false,"five_hour":{"utilization":0},"seven_day":{"utilization":0,"resets_at":10}}]'
@@ -524,10 +524,10 @@ cached() {  # cached NAME 5H_UTIL 5H_RESET WEEKLY_UTIL WEEKLY_RESET
   add_account a org1 good-org1
   add_account b org2 good-org2
   local now; now=$(date +%s)
-  cached a 0.96 $((now - 60)) 0.67 $((now + 3600))     # 5h full, but reset a minute ago
+  cached a 0.995 $((now - 60)) 0.67 $((now + 3600))    # 5h full, but reset a minute ago
   cached b 0.28 $((now + 9000)) 0.44 $((now + 60000))
   [ "$(usage_preferred_cached a b)" = a ]
-  cached a 0.96 $((now + 600)) 0.67 $((now + 3600))     # 5h full until later
+  cached a 0.995 $((now + 600)) 0.67 $((now + 3600))    # 5h full until later
   [ "$(usage_preferred_cached a b)" = b ]
 }
 

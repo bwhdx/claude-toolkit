@@ -125,7 +125,7 @@ follows it when it changes, without a restart:
 
 Claude Code asks the helper for a token every minute. The helper checks the shared account's usage
 at most every 2 minutes (`CC_AUTH_SESSION_CHECK_SECS`, one check for all sessions). Once the
-account is limited or past 95% of either window (`CC_AUTH_SWITCH_AT`), every session moves to the
+account is limited or past 99% of either window (`CC_AUTH_SWITCH_AT`), every session moves to the
 account with room whose weekly window resets soonest. It also moves back: when the account with the
 soonest weekly reset has room again (say its 5-hour window reset), sessions return to it, so the
 allowance about to reset is always used first. Switches are logged as `session_switched`
@@ -139,10 +139,10 @@ cc-auth use --auto                # back to automatic, picking the best account 
 
 ### Spending what sessions leave behind
 
-Sessions leave an account at 95% of a window, so each week every account they move off still has
-up to 5% unused. `cc-auth pick --leftover` names the account a background agent should use to
+Sessions leave an account at 99% of a window, so each week every account they move off still has
+up to 1% unused. `cc-auth pick --leftover` names the account a background agent should use to
 spend that: of the accounts sessions have left for the week (weekly window at or past
-`CC_AUTH_SWITCH_AT`, both windows below `CC_AUTH_LEFTOVER_STOP`, default 99%, not rejected), the
+`CC_AUTH_SWITCH_AT`, both windows below `CC_AUTH_LEFTOVER_STOP`, default 100%, not rejected), the
 one whose weekly window resets soonest. Sessions do not go back to those accounts before their
 weekly reset, so the agent takes nothing from them. With nothing left over it names the account
 sessions would pick.

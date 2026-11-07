@@ -130,9 +130,10 @@ usage_probe_all() {
   echo "$results"
 }
 
-# Share of either window at which an account counts as full: switching just before the limit
-# avoids a session being stopped mid-task.
-CC_AUTH_SWITCH_AT="${CC_AUTH_SWITCH_AT:-0.95}"
+# Share of either window at which an account counts as full for sessions. 99%: the session account
+# is checked every 2 minutes and sessions spend a few percent an hour, so 1% is ample to switch
+# before the limit, and sessions get all but the last 1% of every account.
+CC_AUTH_SWITCH_AT="${CC_AUTH_SWITCH_AT:-0.99}"
 
 # The account to use: of those with room (read, not rejected, both windows below the switch
 # threshold, with a long-term token), the one whose weekly window resets soonest, so capacity
@@ -165,9 +166,10 @@ usage_preferred_cached() {
     | sort_by(.r) | .[0].n // empty' "$@" < "$CC_AUTH_STATE_FILE"
 }
 
-# Ceiling for spending what sessions leave behind: past this share of either window an account is
-# left alone, so the last sliver is a buffer rather than a turn cut off part-way.
-CC_AUTH_LEFTOVER_STOP="${CC_AUTH_LEFTOVER_STOP:-0.99}"
+# Ceiling for spending what sessions leave behind. 100%: the background agent takes the last 1%
+# of each account sessions have left; when an account is refused (rejected) it moves to the next,
+# so an occasional turn cut off at the limit is the price of using everything.
+CC_AUTH_LEFTOVER_STOP="${CC_AUTH_LEFTOVER_STOP:-1.0}"
 
 # The account a background agent should use so that it spends what sessions leave behind.
 # Leftover accounts are those sessions have left for the rest of the week: weekly window at or past

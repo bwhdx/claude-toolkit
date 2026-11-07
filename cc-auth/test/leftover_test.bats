@@ -15,6 +15,9 @@ setup() {
 
   TOOLKIT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
   CC_AUTH="$TOOLKIT_ROOT/cc-auth/cc-auth"
+  # The policy tests below use a wide band (sessions leave at 95%, the agent stops at 99%) so the
+  # figures read clearly; the defaults have their own test.
+  export CC_AUTH_SWITCH_AT=0.95 CC_AUTH_LEFTOVER_STOP=0.99
   source "$TOOLKIT_ROOT/lib/common.bash"
   source "$TOOLKIT_ROOT/cc-auth/lib/keychain.bash"
   source "$TOOLKIT_ROOT/cc-auth/lib/vault.bash"
@@ -186,4 +189,19 @@ pick() { usage_pick_leftover "$1" "${2:-}" | jq -r '"\(.account) \(.reason)"'; }
   [ "$status" -eq 2 ]
   run "$CC_AUTH" pick --bogus
   [ "$status" -eq 2 ]
+}
+
+@test "defaults: sessions leave an account at 99%, the agent spends it to 100%" {
+  run bash -c "unset CC_AUTH_SWITCH_AT CC_AUTH_LEFTOVER_STOP; source '$TOOLKIT_ROOT/cc-auth/lib/usage.bash'; echo \$CC_AUTH_SWITCH_AT \$CC_AUTH_LEFTOVER_STOP"
+  [ "$output" = "0.99 1.0" ]
+}
+
+@test "defaults: the agent takes a 99% account, and shares the sessions' pick when none is left" {
+  local r
+  CC_AUTH_SWITCH_AT=0.99 CC_AUTH_LEFTOVER_STOP=1.0
+  r=$(arr "$(res fresh 0.40 0.0 100)" "$(res brim 0.99 0.0 300)" "$(res full 1.0 0.0 50 rejected)")
+  [ "$(pick "$r")" = "brim leftover" ]
+  r=$(arr "$(res later 0.40 0.0 300)" "$(res sooner 0.97 0.0 100)" "$(res full 1.0 0.0 50 rejected)")
+  [ "$(pick "$r")" = "sooner fallback" ]   # 97% is still the sessions' account: shared
+  [ "$(usage_pick "$r")" = "sooner" ]
 }
