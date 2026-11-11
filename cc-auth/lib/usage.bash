@@ -103,7 +103,9 @@ usage_record() {
   state_set_windows "$name" "$(jq -c '{five_hour: (.five_hour // {} | {utilization, resets_at}),
     seven_day: (.seven_day // {} | {utilization, resets_at}), status}' <<< "$res")"
   now=$(now_epoch)
-  if [[ "$status" == rejected && "$resets" -gt "$now" ]]; then
+  if [[ "$status" != rejected ]]; then
+    state_clear_limited "$name"
+  elif [[ "$resets" -gt "$now" ]]; then
     state_mark_limited "$name" $(( resets - now ))
   fi
 }

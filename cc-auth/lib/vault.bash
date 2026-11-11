@@ -242,6 +242,14 @@ state_mark_limited() {
     '.accounts[$name].limited_until = $until'
 }
 
+# Clear an account's limit, once a live check shows it has room again (a limit can lift before its
+# reset, for example when the provider resets an account early).
+# Args: $1 = name
+state_clear_limited() {
+  json_edit "$CC_AUTH_STATE_FILE" --arg name "$1" \
+    'if .accounts[$name].limited_until then .accounts[$name].limited_until = null else . end'
+}
+
 # Check if an account is currently limited
 # Args: $1 = name
 # Returns: 0 if limited, 1 if available

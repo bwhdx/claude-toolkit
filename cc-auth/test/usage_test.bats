@@ -129,6 +129,16 @@ add_account() {  # add_account NAME ORG [LONGTERM_TOKEN] [OAUTH_TOKEN]
   ! state_is_limited a
 }
 
+@test "usage lifts a limit once a live check shows the account has room again" {
+  add_account a org1 good-org1
+  state_mark_limited a 86400     # hit its limit, due back tomorrow, but reset early
+  state_is_limited a
+  run "$CC_AUTH" usage --json
+  [ "$status" -eq 0 ]
+  ! state_is_limited a
+  [ "$(jq -r '.accounts.a.limited_until' "$CC_AUTH_STATE_FILE")" = null ]
+}
+
 @test "usage flags a token from another organization and fails for an account without a token" {
   add_account a org1 good-orgX
   add_account b org2
@@ -551,6 +561,20 @@ cached() {  # cached NAME 5H_UTIL 5H_RESET WEEKLY_UTIL WEEKLY_RESET
   [ "$output" = soon-org1 ]
   [ "$(state_session_account)" = sooner ]
   grep -q '"reason":"preferred"' "$CC_AUTH_DIR/events.jsonl"
+}
+
+@test "token: moves to an account whose limit lifted before its reset" {
+  add_account sooner org1 good-org1
+  add_account later org2 good-org2
+  local now; now=$(date +%s)
+  state_mark_limited sooner 86400
+  cached sooner 0.0 $((now + 600)) 0.0 $((now + 86400))
+  cached later 0.28 $((now + 9000)) 0.44 $((now + 3 * 86400))
+  state_set_session_account later
+  "$CC_AUTH" usage --json > /dev/null     # live check: sooner has room again
+  run "$CC_AUTH" token
+  [ "$output" = good-org1 ]
+  [ "$(state_session_account)" = sooner ]
 }
 
 @test "token: stays put when the preferred account turns out to have no room" {
